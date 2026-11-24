@@ -92,7 +92,7 @@ def load_models():
     """Load both YOLO and CNN models."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Load YOLOv8n for general Car validation (COCO dataset)e
+    # Load YOLOv8n for general Car validation (COCO dataset)
     yolo_val = YOLO("yolov8n.pt")
     
     # Load custom YOLOv9c
