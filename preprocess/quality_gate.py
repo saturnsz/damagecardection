@@ -9,13 +9,22 @@ with CLAHE; images that pass both checks proceed unchanged.
 Dependencies: cv2, numpy (no other packages required).
 """
 
+import os
+
 import cv2
 import numpy as np
+import yaml
 
 
 # ---------------------------------------------------------------------------
 # Default configuration (IQ-6)
 # ---------------------------------------------------------------------------
+
+_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config",
+    "quality_gate.yaml",
+)
 
 DEFAULT_CONFIG: dict = {
     "blur_threshold": 100,        # Laplacian variance below this → blurry
@@ -24,6 +33,19 @@ DEFAULT_CONFIG: dict = {
     "clahe_tile_grid_size": (8, 8),  # CLAHE tile grid size
     "resize_width": 500,          # Width (px) used for blur measurement only
 }
+
+
+def load_gate_config(config: dict = None) -> dict:
+    """Load quality gate parameters from ``config/quality_gate.yaml`` merged with defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.isfile(_CONFIG_PATH):
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f) or {}
+        if isinstance(loaded, dict):
+            cfg.update(loaded)
+    if config:
+        cfg.update(config)
+    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +230,8 @@ def run_gate(image_bgr: np.ndarray, config: dict = None) -> dict:
     """
     _validate_image(image_bgr)
 
-    # Merge caller config with defaults (IQ-6)
-    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    # Merge YAML config and caller config with defaults (IQ-6)
+    cfg = load_gate_config(config)
 
     blur_threshold = cfg["blur_threshold"]
     dark_threshold = cfg["dark_threshold"]

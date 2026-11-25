@@ -137,13 +137,28 @@ class _ReportPDF(FPDF):
         self.cell(0, 8, f"{self._report_id}  |  Halaman {self.page_no()}/{{nb}}", align="C")
 
 
+_DEFAULT_DISCLAIMER = (
+    "Laporan ini merupakan hasil analisis awal sistem otomatis berbasis luas area "
+    "kerusakan, tidak mengukur kedalaman atau kerusakan struktural tersembunyi, dan "
+    "tidak menggantikan pemeriksaan fisik oleh teknisi atau pemeriksa berwenang."
+)
+
+
+def _fmt_int(value: Any) -> str:
+    """Format integer area metric safely."""
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def build_report(context: Dict[str, Any]) -> bytes:
     """Build the inspection-report PDF and return its content as *bytes*.
 
     Parameters
     ----------
     context : dict
-        Dictionary with keys described in the module docstring / PRD.
+        Dictionary with keys described in the module docstring / PRD Induk.
 
     Returns
     -------
@@ -160,8 +175,19 @@ def build_report(context: Dict[str, Any]) -> bytes:
     gate_message: str = _safe_str(context.get("gate_message"))
     detections: List[Dict[str, Any]] = context.get("detections", [])
     dsi: float = float(context.get("dsi", 0.0))
-    triage: Dict[str, Any] = context.get("triage_result", {})
-    disclaimer: str = _safe_str(context.get("disclaimer"))
+    damage_area: Optional[int] = context.get("damage_area")
+    body_area: Optional[int] = context.get("body_area")
+    used_fallback_area: bool = bool(context.get("used_fallback_area", False))
+    n_clusters: int = int(context.get("n_clusters", 0))
+    max_cluster_ratio: float = float(context.get("max_cluster_ratio", 0.0))
+    if max_cluster_ratio > 1.0:
+        max_cluster_ratio = max_cluster_ratio / 100.0
+    triage: Dict[str, Any] = context.get("triage_result", {}) or {}
+    severity_label: str = _safe_str(
+        context.get("severity_label") or triage.get("label") or triage.get("level_id")
+    )
+    severity_reason: str = _safe_str(context.get("severity_reason"))
+    disclaimer: str = _safe_str(context.get("disclaimer") or _DEFAULT_DISCLAIMER)
 
     pdf = _ReportPDF(report_id=report_id, orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=_MARGIN)
@@ -287,18 +313,18 @@ def build_report(context: Dict[str, Any]) -> bytes:
     pdf.ln(2)
 
     # -----------------------------------------------------------------------
-    # 4. Hasil Deteksi  (PD-1)
+    # 4. Hasil Deteksi & Perhitungan DSI  (PD-1, PD-4)
     # -----------------------------------------------------------------------
-    _ensure_space(pdf, 30)
-    _section_heading(pdf, "3. Hasil Deteksi")
+    _ensure_space(pdf, 35)
+    _section_heading(pdf, "3. Hasil Deteksi & Perhitungan DSI")
 
     if detections:
-        col_widths = [24, 34, 46, 26, 26]
+        col_widths = [22, 18, 28, 42, 23, 23]
         total_cw = sum(col_widths)
         scale = _CONTENT_W / total_cw
         col_widths = [round(w * scale, 1) for w in col_widths]
 
-        headers = ["ID", "YOLO Deteksi", "CNN Keparahan", "CNN Conf.", "YOLO Conf."]
+        headers = ["ID", "Klaster", "YOLO Deteksi", "CNN Prediksi", "CNN Conf.", "YOLO Conf."]
 
         pdf.set_font(_FONT, "B", _SMALL_SIZE)
         pdf.set_fill_color(50, 50, 50)
@@ -316,13 +342,14 @@ def build_report(context: Dict[str, Any]) -> bytes:
 
             row = [
                 _safe_str(det.get("ID")),
+                _safe_str(det.get("Klaster")),
                 _safe_str(det.get("YOLO Deteksi")),
-                _safe_str(det.get("CNN Keparahan")),
+                _safe_str(det.get("CNN Keparahan") or det.get("CNN Prediksi")),
                 _fmt_conf(det.get("CNN Confidence")),
                 _fmt_conf(det.get("YOLO Confidence")),
             ]
             for i, val in enumerate(row):
-                align = "C" if i == 0 else ("L" if i <= 2 else "C")
+                align = "C" if i in (0, 1, 4, 5) else "L"
                 nx = "LMARGIN" if i == len(row) - 1 else "RIGHT"
                 ny = "NEXT" if i == len(row) - 1 else "TOP"
                 pdf.cell(col_widths[i], _TABLE_LINE_H, val, border=1, fill=True, align=align, new_x=nx, new_y=ny)
@@ -333,40 +360,50 @@ def build_report(context: Dict[str, Any]) -> bytes:
 
     pdf.ln(3)
 
+    _ensure_space(pdf, 28)
     pdf.set_font(_FONT, "B", _SECTION_SIZE)
     pdf.set_fill_color(240, 240, 240)
-    dsi_text = f"Damage Severity Index (DSI): {dsi:.1f}%"
+    dsi_text = (
+        f"DSI: {dsi:.1f}%   |   Titik Kerusakan: {n_clusters}   |   "
+        f"Klaster Dominan: {max_cluster_ratio * 100:.1f}%"
+    )
     pdf.cell(0, 10, dsi_text, new_x="LMARGIN", new_y="NEXT", align="C", fill=True, border=1)
-    pdf.ln(4)
+    pdf.ln(2)
+
+    if damage_area is not None and body_area is not None:
+        area_source = "Cadangan (luas gambar penuh)" if used_fallback_area else "Bounding box bodi kendaraan"
+        _kv_row(pdf, "Luas Gabungan Rusak:", f"{_fmt_int(damage_area)} px (union mask)")
+        _kv_row(pdf, "Luas Acuan Bodi:", f"{_fmt_int(body_area)} px ({area_source})")
+
+    if used_fallback_area:
+        pdf.set_font(_FONT, "I", _SMALL_SIZE)
+        pdf.set_text_color(100, 100, 100)
+        pdf.multi_cell(
+            0,
+            _LINE_H - 1,
+            "* Catatan: Bounding box bodi kendaraan tidak tersedia; luas bodi menggunakan luas gambar sebagai cadangan.",
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
+        pdf.set_text_color(0, 0, 0)
+
+    pdf.ln(3)
 
     # -----------------------------------------------------------------------
-    # 5. Rekomendasi Triase  (PD-1, TR-5)
+    # 5. Penilaian Keparahan & Rekomendasi Triase  (PD-1, TR-4, TR-5)
     # -----------------------------------------------------------------------
-    _ensure_space(pdf, 45)
-    _section_heading(pdf, "4. Rekomendasi Jalur")
+    _ensure_space(pdf, 48)
+    _section_heading(pdf, "4. Penilaian Keparahan & Rekomendasi Jalur")
 
-    level = _safe_str(triage.get("level"))
-    level_id = _safe_str(triage.get("level_id"))
     path = _safe_str(triage.get("path"))
     sop = _safe_str(triage.get("sop"))
     estimate = _safe_str(triage.get("estimate"))
-    override = bool(triage.get("override", False))
-    override_reason = _safe_str(triage.get("override_reason"))
-    original_level = _safe_str(triage.get("original_level"))
 
-    _kv_row(pdf, "Level:", f"{level} ({level_id})")
+    _kv_row(pdf, "Label Keparahan:", severity_label)
+    _kv_row(pdf, "Alasan Penilaian:", severity_reason)
     _kv_row(pdf, "Rekomendasi Jalur:", path)
     _kv_row(pdf, "SOP:", sop)
     _kv_row(pdf, "Estimasi:", estimate)
-
-    if override:
-        pdf.ln(2)
-        pdf.set_font(_FONT, "B", _BODY_SIZE)
-        pdf.set_text_color(180, 0, 0)
-        pdf.cell(0, _LINE_H, "* Override diterapkan", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(0, 0, 0)
-        _kv_row(pdf, "Level Awal:", original_level)
-        _kv_row(pdf, "Alasan Override:", override_reason)
 
     pdf.ln(4)
 
@@ -429,7 +466,7 @@ def _kv_row(pdf: FPDF, key: str, value: str) -> None:
     """Print a bold *key* followed by a normal *value*."""
     pdf.set_x(_MARGIN)
     pdf.set_font(_FONT, "B", _BODY_SIZE)
-    pdf.cell(38, _LINE_H, _safe_str(key), new_x="RIGHT", new_y="TOP")
+    pdf.cell(44, _LINE_H, _safe_str(key), new_x="RIGHT", new_y="TOP")
     pdf.set_font(_FONT, "", _BODY_SIZE)
     pdf.multi_cell(0, _LINE_H, _safe_str(value), new_x="LMARGIN", new_y="NEXT")
 

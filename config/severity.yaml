@@ -1,0 +1,6 @@
+# Konfigurasi Penilaian Keparahan Multi-Faktor (SV-7, CL-3)
+dsi_severe: 40.0             # DSI >= 40% -> Rusak Parah
+dsi_moderate: 15.0           # 15% <= DSI < 40% -> Rusak Sedang
+cluster_count_upgrade: 2     # DSI < 15% dan jumlah titik > 2 -> naik ke Rusak Sedang
+dominant_cluster_ratio: 0.25 # Satu klaster >= 25% luas bodi -> Rusak Parah
+gap_ratio: 0.05              # Ambang kedekatan klaster = 5% diagonal gambar

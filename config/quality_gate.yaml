@@ -1,0 +1,6 @@
+# Konfigurasi Image Quality Gatekeeper (IQ-6)
+blur_threshold: 100        # Variansi Laplacian minimum (di bawah nilai ini = buram / ditolak)
+dark_threshold: 80         # Rata-rata channel L* (LAB, 0-255) di bawah nilai ini = gelap
+clahe_clip_limit: 2.0      # Clip limit untuk CLAHE
+clahe_tile_grid_size: [8, 8]
+resize_width: 500          # Lebar acuan (px) sebelum ukur blur agar tidak bergantung resolusi

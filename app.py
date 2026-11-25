@@ -12,7 +12,10 @@ from ultralytics import YOLO
 from torchvision import transforms
 from models import load_cnn_model
 from preprocess.quality_gate import run_gate
-from triage.rules import triage, get_disclaimer
+from severity.clustering import cluster_boxes
+from severity.dsi import compute_dsi, select_body_box
+from severity.rules import classify
+from triage.mapping import triage, get_disclaimer
 from report.pdf_builder import build_report, generate_report_id, cleanup_temp_files
 
 # --- Page Config ---
@@ -88,6 +91,53 @@ st.markdown("""
         font-size: 0.95rem;
         box-shadow: 0 4px 15px rgba(0,0,0,0.15);
     }
+    /* Severity Multi-Factor Card Styling */
+    .severity-card {
+        padding: 18px 20px;
+        border-radius: 12px;
+        margin: 12px 0 16px 0;
+        background: rgba(15, 23, 42, 0.78);
+        color: #ffffff;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.28);
+    }
+    .severity-badge {
+        display: inline-block;
+        padding: 6px 14px;
+        border-radius: 999px;
+        font-weight: 700;
+        font-size: 1.05rem;
+        margin-bottom: 8px;
+    }
+    .severity-reason {
+        font-size: 0.92rem;
+        color: #e2e8f0;
+        margin: 4px 0 14px 0;
+        line-height: 1.45;
+    }
+    .severity-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+    }
+    .severity-metric-box {
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 8px;
+        padding: 10px 8px;
+        text-align: center;
+    }
+    .severity-metric-label {
+        font-size: 0.75rem;
+        color: #cbd5e1;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    .severity-metric-value {
+        font-size: 1.45rem;
+        font-weight: 700;
+        color: #ffffff;
+        margin-top: 2px;
+    }
     /* Triage Card Styling */
     .triage-card {
         padding: 20px;
@@ -97,8 +147,9 @@ st.markdown("""
         font-weight: 500;
     }
     .triage-card h3 { color: inherit; }
+    .triage-none { background: linear-gradient(135deg, #17a2b8, #138496); }
     .triage-minor { background: linear-gradient(135deg, #28a745, #20c997); }
-    .triage-moderate { background: linear-gradient(135deg, #ffc107, #fd7e14); color: #333; }
+    .triage-moderate { background: linear-gradient(135deg, #ffc107, #fd7e14); color: #212529; }
     .triage-severe { background: linear-gradient(135deg, #dc3545, #c82333); }
 </style>
 """, unsafe_allow_html=True)
@@ -171,40 +222,16 @@ def _save_temp_image(image_bgr, prefix="img", max_dim=1600):
     tmp.close()
     return tmp.name
 
-# --- Helper: Compute DSI from detections ---
-def compute_dsi(analysis_results):
-    """Compute Damage Severity Index as a percentage.
-    
-    DSI = (number of 'Rusak' / severe detections / total detections) * 100
-    weighted by average CNN confidence for those detections.
-    """
-    if not analysis_results:
-        return 0.0
-    
-    total = len(analysis_results)
-    severe_count = 0
-    severe_conf_sum = 0.0
-    
-    for det in analysis_results:
-        if "Rusak" in det.get("CNN Keparahan", "") or "Parah" in det.get("CNN Keparahan", "") or "Severe" in det.get("CNN Keparahan", ""):
-            severe_count += 1
-            conf_str = det.get("CNN Confidence", "0%").replace("%", "")
-            try:
-                severe_conf_sum += float(conf_str)
-            except ValueError:
-                pass
-    
-    if severe_count == 0:
-        # All minor — DSI is low, proportional to damage density
-        return min(14.9, (total / 10.0) * 14.9)
-    
-    # Weighted DSI: ratio of severe * average confidence of severe detections
-    severity_ratio = severe_count / total
-    avg_conf = severe_conf_sum / severe_count if severe_count > 0 else 50.0
-    
-    # Scale: severity_ratio * avg_conf gives 0-100 range
-    dsi = severity_ratio * avg_conf
-    return min(100.0, max(0.0, dsi))
+def _config_signature() -> str:
+    """Return mtime fingerprint of YAML configs so edits take effect immediately."""
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config")
+    parts = []
+    for name in ("quality_gate.yaml", "severity.yaml", "triage.yaml"):
+        path = os.path.join(base_dir, name)
+        if os.path.isfile(path):
+            parts.append(f"{name}:{int(os.path.getmtime(path))}")
+    return "|".join(parts)
+
 
 # --- Labels Mapping ---
 CNN_CLASSES = {0: "Ringan / Minor", 1: "Rusak"}
@@ -242,8 +269,9 @@ def main():
                 <li><b>Quality Gate:</b> Validasi kualitas gambar (blur & kecerahan) sebelum analisis.</li>
                 <li><b>Model 1 (YOLOv9c):</b> Deteksi dan lokalisasi area bodi.</li>
                 <li><b>Proses (Crop Otomatis):</b> Memotong area rusak secara real-time.</li>
-                <li><b>Model 2 (ResNet18+CBAM):</b> Klasifikasi tingkat keparahan geometri kerusakan.</li>
-                <li><b>Triase & SOP:</b> Rekomendasi jalur penanganan dan SOP bengkel.</li>
+                <li><b>Model 2 (ResNet18+CBAM):</b> Validasi status kerusakan area deteksi.</li>
+                <li><b>Penilaian Keparahan (DSI):</b> Perhitungan luas gabungan kerusakan, pengelompokan klaster titik, dan penentuan label <i>Ringan / Sedang / Parah</i>.</li>
+                <li><b>Triase &amp; SOP:</b> Pemetaan label keparahan ke rekomendasi jalur penanganan dan SOP bengkel.</li>
                 <li><b>Laporan PDF:</b> Unduh laporan inspeksi awal untuk dokumentasi.</li>
             </ol>
         </div>
@@ -326,7 +354,7 @@ def main():
 
         if uploaded_file is not None:
             raw_bytes = uploaded_file.getvalue()
-            analysis_key = f"{hashlib.md5(raw_bytes).hexdigest()}_{confidence_threshold:.2f}"
+            analysis_key = f"{hashlib.md5(raw_bytes).hexdigest()}_{confidence_threshold:.2f}_{_config_signature()}"
 
             if st.session_state.get("analysis_key") != analysis_key:
                 image_bytes = np.asarray(bytearray(raw_bytes), dtype=np.uint8)
@@ -346,7 +374,10 @@ def main():
                     "num_raw_detections": 0,
                     "img_display": None,
                     "analysis_results": [],
+                    "dsi_result": None,
                     "dsi_value": 0.0,
+                    "clusters": [],
+                    "severity_result": None,
                     "triage_result": None,
                     "disclaimer_text": "",
                     "report_id": None,
@@ -362,10 +393,12 @@ def main():
                     with st.spinner("Melakukan Validasi Objek..."):
                         val_results = yolo_val.predict(img_processed, conf=0.15)
                         vehicle_classes = [2, 3, 5, 7]
-                        is_vehicle = any(
-                            int(box.cls[0].item()) in vehicle_classes
+                        vehicle_boxes = [
+                            tuple(map(int, box.xyxy[0].tolist()))
                             for box in val_results[0].boxes
-                        )
+                            if int(box.cls[0].item()) in vehicle_classes
+                        ]
+                        is_vehicle = len(vehicle_boxes) > 0
 
                     cache["is_vehicle"] = is_vehicle
 
@@ -376,101 +409,177 @@ def main():
                         detections = results[0].boxes
                         cache["num_raw_detections"] = len(detections)
 
-                        if len(detections) > 0:
-                            analysis_results = []
-                            detected_classes = []
+                        raw_items = []
+                        damage_boxes = []
+                        h, w, _ = img_processed.shape
 
-                            for i, box in enumerate(detections):
-                                cls_id = int(box.cls[0].item())
-                                conf = float(box.conf[0].item())
-                                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        for i, box in enumerate(detections):
+                            cls_id = int(box.cls[0].item())
+                            conf = float(box.conf[0].item())
+                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                            x1, y1 = max(0, x1), max(0, y1)
+                            x2, y2 = min(w, x2), min(h, y2)
 
-                                h, w, _ = img_processed.shape
-                                x1, y1 = max(0, x1), max(0, y1)
-                                x2, y2 = min(w, x2), min(h, y2)
+                            cropped_img = img_processed[y1:y2, x1:x2]
+                            if cropped_img.size == 0:
+                                continue
 
-                                cropped_img = img_processed[y1:y2, x1:x2]
-                                if cropped_img.size == 0:
-                                    continue
+                            input_tensor = preprocess_for_cnn(cropped_img).to(device)
+                            with torch.no_grad():
+                                outputs = cnn_model(input_tensor)
+                                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                                pred_class_id = torch.argmax(probabilities, dim=1).item()
+                                pred_confidence = probabilities[0][pred_class_id].item()
 
-                                input_tensor = preprocess_for_cnn(cropped_img).to(device)
-                                with torch.no_grad():
-                                    outputs = cnn_model(input_tensor)
-                                    probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                                    pred_class_id = torch.argmax(probabilities, dim=1).item()
-                                    pred_confidence = probabilities[0][pred_class_id].item()
+                            cnn_label = CNN_CLASSES.get(pred_class_id, "Unknown")
+                            yolo_label_name = "Rusak" if cls_id == YOLO_TARGET_CLASS else "Normal"
 
-                                severity_label = CNN_CLASSES.get(pred_class_id, "Unknown")
-                                yolo_label_name = "Rusak" if cls_id == 1 else "Normal"
-                                detected_classes.append(yolo_label_name)
+                            dmg_idx = None
+                            if cls_id == YOLO_TARGET_CLASS:
+                                dmg_idx = len(damage_boxes)
+                                damage_boxes.append((x1, y1, x2, y2))
 
-                                analysis_results.append({
-                                    "ID": f"Deteksi #{i+1}",
-                                    "YOLO Deteksi": yolo_label_name,
-                                    "CNN Keparahan": severity_label,
-                                    "CNN Confidence": f"{pred_confidence*100:.1f}%",
-                                    "YOLO Confidence": f"{conf*100:.1f}%",
-                                })
+                            raw_items.append({
+                                "det_index": i + 1,
+                                "cls_id": cls_id,
+                                "conf": conf,
+                                "bbox": (x1, y1, x2, y2),
+                                "pred_class_id": pred_class_id,
+                                "pred_confidence": pred_confidence,
+                                "cnn_label": cnn_label,
+                                "yolo_label": yolo_label_name,
+                                "dmg_idx": dmg_idx,
+                            })
 
-                                color = (0, 0, 255) if pred_class_id == 1 else (0, 255, 0)
-                                cv2.rectangle(img_display, (x1, y1), (x2, y2), color, 3)
+                        # STEP 2: MULTI-FACTOR SEVERITY ASSESSMENT (DSI + CLUSTERING + RULES)
+                        body_box = select_body_box(
+                            vehicle_boxes,
+                            damage_boxes=damage_boxes,
+                            shape=img_processed.shape,
+                        )
+                        dsi_result = compute_dsi(
+                            damage_boxes,
+                            shape=img_processed.shape,
+                            body_box=body_box,
+                        )
+                        clusters = cluster_boxes(
+                            damage_boxes,
+                            shape=img_processed.shape,
+                            body_area=dsi_result["body_area"],
+                        )
+                        max_cluster_ratio = max((c["ratio"] for c in clusters), default=0.0)
+                        severity_result = classify(
+                            dsi=dsi_result["dsi"],
+                            n_clusters=len(clusters),
+                            max_cluster_ratio=max_cluster_ratio,
+                        )
 
-                                label_text = f"#{i+1}: {severity_label}"
-                                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                                cv2.rectangle(img_display, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
-                                cv2.putText(img_display, label_text, (x1+5, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                        # STEP 3: TRIASE & SOP MAPPING FROM SEVERITY LABEL
+                        triage_result = triage(severity_result["label"])
+                        disclaimer_text = get_disclaimer()
 
-                            cache["img_display"] = img_display
-                            cache["analysis_results"] = analysis_results
+                        # Map each damage box index to its cluster ID (UI-3)
+                        box_to_cluster = {}
+                        for cluster in clusters:
+                            for dmg_idx in cluster["indices"]:
+                                box_to_cluster[dmg_idx] = cluster["cluster_id"]
 
-                            if analysis_results:
-                                dsi_value = compute_dsi(analysis_results)
-                                triage_result = triage(
-                                    dsi=dsi_value,
-                                    num_boxes=len(analysis_results),
-                                    classes=detected_classes,
-                                )
-                                disclaimer_text = get_disclaimer()
-                                cache["dsi_value"] = dsi_value
-                                cache["triage_result"] = triage_result
-                                cache["disclaimer_text"] = disclaimer_text
+                        # Draw cluster grouping outlines when a cluster merges >1 box
+                        for cluster in clusters:
+                            if len(cluster["boxes"]) > 1:
+                                cx1, cy1, cx2, cy2 = cluster["bbox"]
+                                cv2.rectangle(img_display, (cx1, cy1), (cx2, cy2), (0, 215, 255), 2)
 
-                                # Build PDF once and cache bytes in session_state
-                                temp_files = []
-                                try:
-                                    original_tmp = _save_temp_image(img_original, prefix="orig_")
-                                    temp_files.append(original_tmp)
+                        analysis_results = []
+                        for item in raw_items:
+                            x1, y1, x2, y2 = item["bbox"]
+                            det_num = item["det_index"]
+                            cls_id = item["cls_id"]
+                            pred_class_id = item["pred_class_id"]
+                            cnn_label = item["cnn_label"]
 
-                                    annotated_tmp = _save_temp_image(img_display, prefix="annot_")
-                                    temp_files.append(annotated_tmp)
+                            if cls_id == YOLO_TARGET_CLASS:
+                                cid = box_to_cluster.get(item["dmg_idx"], 1)
+                                cluster_str = f"Titik {cid}"
+                                color = (0, 0, 255) if pred_class_id == 1 else (0, 140, 255)
+                                label_text = f"Titik {cid} | #{det_num}: {cnn_label}"
+                            else:
+                                cluster_str = "-"
+                                color = (0, 200, 0)
+                                label_text = f"#{det_num}: Normal"
 
-                                    enhanced_tmp = None
-                                    if gate_result["status"] == "enhanced":
-                                        enhanced_tmp = _save_temp_image(img_processed, prefix="enh_")
-                                        temp_files.append(enhanced_tmp)
+                            analysis_results.append({
+                                "ID": f"Deteksi #{det_num}",
+                                "Klaster": cluster_str,
+                                "YOLO Deteksi": item["yolo_label"],
+                                "CNN Keparahan": cnn_label,
+                                "CNN Confidence": f"{item['pred_confidence']*100:.1f}%",
+                                "YOLO Confidence": f"{item['conf']*100:.1f}%",
+                            })
 
-                                    report_id = generate_report_id()
-                                    timestamp_str = datetime.now().strftime("%d %B %Y, %H:%M:%S WIB")
+                            cv2.rectangle(img_display, (x1, y1), (x2, y2), color, 3)
+                            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+                            if y1 - th - 10 >= 0:
+                                lbl_y1, lbl_y2 = y1 - th - 10, y1
+                                txt_y = y1 - 5
+                            else:
+                                lbl_y1, lbl_y2 = y1, min(h, y1 + th + 10)
+                                txt_y = min(h - 3, y1 + th + 5)
+                            cv2.rectangle(img_display, (x1, lbl_y1), (min(w, x1 + tw + 10), lbl_y2), color, -1)
+                            cv2.putText(img_display, label_text, (x1 + 5, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-                                    pdf_context = {
-                                        "report_id": report_id,
-                                        "timestamp": timestamp_str,
-                                        "original_image_path": original_tmp,
-                                        "annotated_image_path": annotated_tmp,
-                                        "enhanced_image_path": enhanced_tmp,
-                                        "gate_status": gate_result["status"],
-                                        "gate_message": gate_result["message"],
-                                        "detections": analysis_results,
-                                        "dsi": dsi_value,
-                                        "triage_result": triage_result,
-                                        "disclaimer": disclaimer_text,
-                                    }
-                                    cache["report_id"] = report_id
-                                    cache["pdf_bytes"] = build_report(pdf_context)
-                                except Exception as e:
-                                    cache["pdf_error"] = str(e)
-                                finally:
-                                    cleanup_temp_files(temp_files)
+                        cache["img_display"] = img_display
+                        cache["analysis_results"] = analysis_results
+                        cache["dsi_result"] = dsi_result
+                        cache["dsi_value"] = dsi_result["dsi"]
+                        cache["clusters"] = clusters
+                        cache["severity_result"] = severity_result
+                        cache["triage_result"] = triage_result
+                        cache["disclaimer_text"] = disclaimer_text
+
+                        # STEP 4: BUILD PDF ONCE AND CACHE BYTES IN SESSION STATE (UI-4)
+                        temp_files = []
+                        try:
+                            original_tmp = _save_temp_image(img_original, prefix="orig_")
+                            temp_files.append(original_tmp)
+
+                            annotated_tmp = _save_temp_image(img_display, prefix="annot_")
+                            temp_files.append(annotated_tmp)
+
+                            enhanced_tmp = None
+                            if gate_result["status"] == "enhanced":
+                                enhanced_tmp = _save_temp_image(img_processed, prefix="enh_")
+                                temp_files.append(enhanced_tmp)
+
+                            report_id = generate_report_id()
+                            timestamp_str = datetime.now().strftime("%d %B %Y, %H:%M:%S WIB")
+
+                            pdf_context = {
+                                "report_id": report_id,
+                                "timestamp": timestamp_str,
+                                "original_image_path": original_tmp,
+                                "annotated_image_path": annotated_tmp,
+                                "enhanced_image_path": enhanced_tmp,
+                                "gate_status": gate_result["status"],
+                                "gate_message": gate_result["message"],
+                                "detections": analysis_results,
+                                "dsi": dsi_result["dsi"],
+                                "damage_area": dsi_result["damage_area"],
+                                "body_area": dsi_result["body_area"],
+                                "used_fallback_area": dsi_result["used_fallback"],
+                                "n_clusters": len(clusters),
+                                "max_cluster_ratio": max_cluster_ratio,
+                                "severity_label": severity_result["label"],
+                                "severity_reason": severity_result["reason"],
+                                "triage_result": triage_result,
+                                "disclaimer": disclaimer_text,
+                            }
+                            cache["report_id"] = report_id
+                            cache["pdf_bytes"] = build_report(pdf_context)
+                        except Exception as e:
+                            cache["pdf_error"] = str(e)
+                        finally:
+                            cleanup_temp_files(temp_files)
 
                 st.session_state["analysis_key"] = analysis_key
                 st.session_state["analysis_cache"] = cache
@@ -520,77 +629,107 @@ def main():
 
                 if not cache["is_vehicle"]:
                     st.error("Validasi Gagal: Sistem tidak mendeteksi adanya mobil pada gambar ini. Mohon unggah citra kendaraan yang benar.")
-                elif cache["num_raw_detections"] == 0:
-                    st.error("YOLOv9c tidak mendeteksi bodi/kerusakan pada gambar ini dengan confidence tersebut. Coba turunkan slider.")
                 else:
-                    st.success(f"Ditemukan {cache['num_raw_detections']} deteksi area pada mobil.")
+                    if cache["num_raw_detections"] == 0:
+                        st.info("YOLOv9c tidak mendeteksi kerusakan pada gambar ini pada confidence tersebut (coba turunkan slider jika memang terdapat kerusakan ringan).")
+                    else:
+                        st.success(f"Ditemukan {cache['num_raw_detections']} deteksi area pada mobil.")
+
                     img_display = cache["img_display"]
                     analysis_results = cache["analysis_results"]
+                    dsi_result = cache["dsi_result"]
+                    severity_result = cache["severity_result"]
+                    triage_result = cache["triage_result"]
+                    disclaimer_text = cache["disclaimer_text"]
 
                     if img_display is not None:
                         st.image(
                             cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB),
                             use_container_width=True,
-                            caption="Citra dengan Deteksi Kerusakan & Klasifikasi",
+                            caption="Citra Hasil Deteksi Kerusakan & Penomoran Titik Klaster",
+                        )
+
+                    # STEP 2: PENILAIAN KEPARAHAN MULTI-FAKTOR & DSI (UI-1, UI-2)
+                    if severity_result and dsi_result:
+                        st.markdown("### Penilaian Keparahan & DSI")
+                        sev_color = severity_result["color"]
+                        badge_fg = "#212529" if severity_result["level"] == "Moderate" else "#ffffff"
+                        area_src_text = (
+                            "Cadangan luas gambar (bodi tidak terdeteksi penuh)"
+                            if dsi_result["used_fallback"]
+                            else "Bounding box bodi kendaraan"
+                        )
+
+                        st.markdown(f"""
+                        <div class="severity-card" style="border: 2px solid {sev_color};">
+                            <span class="severity-badge" style="background-color: {sev_color}; color: {badge_fg};">
+                                {severity_result["icon"]} {severity_result["label"]}
+                            </span>
+                            <div class="severity-reason">
+                                <b>Alasan:</b> {severity_result["reason"]}
+                            </div>
+                            <div class="severity-metrics">
+                                <div class="severity-metric-box">
+                                    <div class="severity-metric-label">DSI</div>
+                                    <div class="severity-metric-value" style="color: {sev_color};">{severity_result["dsi"]:.1f}%</div>
+                                </div>
+                                <div class="severity-metric-box">
+                                    <div class="severity-metric-label">Titik Kerusakan</div>
+                                    <div class="severity-metric-value">{severity_result["n_clusters"]}</div>
+                                </div>
+                                <div class="severity-metric-box">
+                                    <div class="severity-metric-label">Klaster Dominan</div>
+                                    <div class="severity-metric-value">{severity_result["max_cluster_pct"]:.1f}%</div>
+                                </div>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        st.caption(
+                            f"Luas gabungan kerusakan (union): {dsi_result['damage_area']:,} px | "
+                            f"Luas acuan bodi: {dsi_result['body_area']:,} px ({area_src_text})"
                         )
 
                     if analysis_results:
-                        st.markdown("#### Rincian Keparahan Geometri (ResNet-CBAM)")
+                        st.markdown("#### Rincian Deteksi Area (YOLOv9c & ResNet-CBAM)")
                         st.table(analysis_results)
 
-                        # STEP 2: TRIASE KLAIM & REKOMENDASI SOP
+                    # STEP 3: TRIASE KLAIM & REKOMENDASI SOP (TR-1..TR-6)
+                    if triage_result and severity_result:
                         st.markdown("---")
                         st.markdown("### Rekomendasi Triase & SOP Bengkel")
-
-                        dsi_value = cache["dsi_value"]
-                        triage_result = cache["triage_result"]
-                        disclaimer_text = cache["disclaimer_text"]
-                        dsi_color = triage_result["color"]
-
-                        st.markdown(f"""
-                        <div style="text-align: center; padding: 15px; border-radius: 10px; 
-                                    background: rgba(0, 0, 0, 0.55);
-                                    border: 2px solid {dsi_color}; margin-bottom: 15px;">
-                            <h2 style="color: {dsi_color}; margin: 0;">Damage Severity Index (DSI)</h2>
-                            <h1 style="color: {dsi_color}; margin: 5px 0; font-size: 3rem;">{dsi_value:.1f}%</h1>
-                        </div>
-                        """, unsafe_allow_html=True)
 
                         level_lower = triage_result["level"].lower()
                         card_class = f"triage-{level_lower}"
 
                         st.markdown(f"""
                         <div class="triage-card {card_class}">
-                            <h3 style="margin-top: 0;">{triage_result["icon"]} Tingkat: {triage_result["level"]} ({triage_result["level_id"]})</h3>
+                            <h3 style="margin-top: 0;">{triage_result["icon"]} {severity_result["label"]}</h3>
                             <p><b>Rekomendasi Jalur:</b> {triage_result["path"]}</p>
                             <p><b>SOP yang Direkomendasikan:</b> {triage_result["sop"]}</p>
                             <p><b>Estimasi Waktu:</b> {triage_result["estimate"]}</p>
+                            <p style="margin-bottom: 0;"><b>Dasar Penilaian:</b> {severity_result["reason"]}</p>
                         </div>
                         """, unsafe_allow_html=True)
 
-                        if triage_result["override"]:
-                            st.warning(f"Override Diterapkan: {triage_result['override_reason']}")
-
                         st.caption(f"*{disclaimer_text}*")
 
-                        # STEP 3: LAPORAN INSPEKSI PDF
-                        st.markdown("---")
-                        st.markdown("### Unduh Laporan Inspeksi")
+                    # STEP 4: LAPORAN INSPEKSI PDF (PD-1..PD-10)
+                    st.markdown("---")
+                    st.markdown("### Unduh Laporan Inspeksi")
 
-                        if cache["pdf_error"]:
-                            st.error(f"Gagal membuat laporan PDF: {cache['pdf_error']}")
-                        elif cache["pdf_bytes"] is not None:
-                            report_id = cache["report_id"]
-                            st.download_button(
-                                label="Unduh Laporan Inspeksi (PDF)",
-                                data=cache["pdf_bytes"],
-                                file_name=f"laporan_inspeksi_{report_id}.pdf",
-                                mime="application/pdf",
-                                type="primary",
-                            )
-                            st.caption(f"ID Laporan: `{report_id}`")
-                    else:
-                        st.info("Area terdeteksi berstatus 'Normal' (tidak dianalisis keparahannya).")
+                    if cache["pdf_error"]:
+                        st.error(f"Gagal membuat laporan PDF: {cache['pdf_error']}")
+                    elif cache["pdf_bytes"] is not None:
+                        report_id = cache["report_id"]
+                        st.download_button(
+                            label="Unduh Laporan Inspeksi (PDF)",
+                            data=cache["pdf_bytes"],
+                            file_name=f"laporan_inspeksi_{report_id}.pdf",
+                            mime="application/pdf",
+                            type="primary",
+                        )
+                        st.caption(f"ID Laporan: `{report_id}`")
         else:
             st.info("Silakan unggah citra mobil melalui panel di sebelah kiri untuk memulai analisis.")
 

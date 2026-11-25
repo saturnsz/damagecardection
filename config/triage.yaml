@@ -1,0 +1,40 @@
+# Konfigurasi Triase Klaim & Rekomendasi SOP Bengkel (TR-2, TR-3)
+mapping:
+  Rusak Ringan:
+    level: Minor
+    level_id: Ringan
+    path: Fast-Track
+    sop: Compound dan Spot Repaint
+    estimate: 1-2 hari kerja
+    color: "#28a745"
+    icon: "✅"
+  Rusak Sedang:
+    level: Moderate
+    level_id: Sedang
+    path: Standard Workshop Review
+    sop: Ketok Panel, Pendempulan, dan Full Panel Respray
+    estimate: 3-5 hari kerja
+    color: "#ffc107"
+    icon: "⚠️"
+  Rusak Parah:
+    level: Severe
+    level_id: Parah
+    path: Specialist Escalation
+    sop: Penggantian Panel Baru
+    estimate: "> 5 hari kerja"
+    color: "#dc3545"
+    icon: "🔴"
+  Tidak ada kerusakan terdeteksi:
+    level: None
+    level_id: Tidak Ada Kerusakan
+    path: Tidak Diperlukan Perbaikan
+    sop: Tidak ada tindakan perbaikan yang diperlukan
+    estimate: 0 hari kerja
+    color: "#17a2b8"
+    icon: "ℹ️"
+
+disclaimer: >-
+  Rekomendasi ini merupakan hasil analisis awal sistem otomatis berbasis luas area,
+  tidak mengukur kedalaman atau kerusakan struktural tersembunyi, dan tidak
+  menggantikan pemeriksaan fisik oleh teknisi berpengalaman. Keputusan akhir
+  penanganan sepenuhnya berada pada pemeriksa yang berwenang.
