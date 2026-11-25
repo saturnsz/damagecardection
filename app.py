@@ -4,10 +4,14 @@ import torch
 import numpy as np
 import base64
 import os
+import tempfile
 from PIL import Image
 from ultralytics import YOLO
 from torchvision import transforms
 from models import load_cnn_model
+from preprocess.quality_gate import run_gate
+from triage.rules import triage, get_disclaimer
+from report.pdf_builder import build_report, generate_report_id, cleanup_temp_files
 
 # --- Page Config ---
 st.set_page_config(
@@ -21,7 +25,6 @@ st.markdown("""
 <style>
     /* Global Background & Overlay */
     [data-testid="stAppViewContainer"] {
-        /* This will be overwritten dynamically by base64 string later, keeping this as fallback */
         background-color: #f8f9fa;
     }
     
@@ -76,13 +79,24 @@ st.markdown("""
     .info-box {
         background-color: #f8f9fa;
         padding: 24px;
-        border-radius: 16px; /* Ujung dibuat sangat tumpul */
+        border-radius: 16px;
         color: #333;
         font-weight: 400;
         margin-bottom: 20px;
         font-size: 0.95rem;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.15); /* Shadow lembut pengganti garis kaku */
+        box-shadow: 0 4px 15px rgba(0,0,0,0.15);
     }
+    /* Triage Card Styling */
+    .triage-card {
+        padding: 20px;
+        border-radius: 12px;
+        margin: 10px 0;
+        color: #fff;
+        font-weight: 500;
+    }
+    .triage-minor { background: linear-gradient(135deg, #28a745, #20c997); }
+    .triage-moderate { background: linear-gradient(135deg, #ffc107, #fd7e14); color: #333; }
+    .triage-severe { background: linear-gradient(135deg, #dc3545, #c82333); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -105,11 +119,9 @@ def load_models():
 
 def preprocess_for_cnn(crop_img):
     """Preprocess the cropped image for ResNet18."""
-    # Convert OpenCV BGR to RGB PIL Image
     image_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(image_rgb)
     
-    # Standard ResNet transformations
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -125,8 +137,6 @@ def set_background(image_path):
         with open(image_path, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode()
             
-        # We add an overlay (background-blend-mode) to fade the image slightly, 
-        # so it doesn't distract from the minimalist UI elements.
         st.markdown(
             f"""
             <style>
@@ -141,6 +151,50 @@ def set_background(image_path):
             """,
             unsafe_allow_html=True
         )
+
+# --- Helper: Save image to temp file for PDF ---
+def _save_temp_image(image_bgr, prefix="img"):
+    """Save a BGR image to a temporary JPEG file. Returns the path."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", prefix=prefix, delete=False)
+    # Compress to keep PDF small (PD-5)
+    cv2.imwrite(tmp.name, image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    tmp.close()
+    return tmp.name
+
+# --- Helper: Compute DSI from detections ---
+def compute_dsi(analysis_results):
+    """Compute Damage Severity Index as a percentage.
+    
+    DSI = (number of 'Parah / Severe' detections / total detections) * 100
+    combined with average CNN confidence for severe detections.
+    """
+    if not analysis_results:
+        return 0.0
+    
+    total = len(analysis_results)
+    severe_count = 0
+    severe_conf_sum = 0.0
+    
+    for det in analysis_results:
+        if "Parah" in det.get("CNN Keparahan", "") or "Severe" in det.get("CNN Keparahan", ""):
+            severe_count += 1
+            conf_str = det.get("CNN Confidence", "0%").replace("%", "")
+            try:
+                severe_conf_sum += float(conf_str)
+            except ValueError:
+                pass
+    
+    if severe_count == 0:
+        # All minor — DSI is low, proportional to damage density
+        return min(14.9, (total / 10.0) * 14.9)
+    
+    # Weighted DSI: ratio of severe * average confidence of severe detections
+    severity_ratio = severe_count / total
+    avg_conf = severe_conf_sum / severe_count if severe_count > 0 else 50.0
+    
+    # Scale: severity_ratio * avg_conf gives 0-100 range
+    dsi = severity_ratio * avg_conf
+    return min(100.0, max(0.0, dsi))
 
 # --- Labels Mapping ---
 CNN_CLASSES = {0: "Ringan / Minor", 1: "Parah / Severe"}
@@ -175,10 +229,12 @@ def main():
             <p>Sistem ini menerapkan alur kerja hibrida sesuai rancangan Anda:</p>
             <ol>
                 <li><b>Input:</b> Mengunggah citra mobil (tanpa database).</li>
+                <li><b>Quality Gate:</b> Validasi kualitas gambar (blur & kecerahan) sebelum analisis.</li>
                 <li><b>Model 1 (YOLOv9c):</b> Deteksi dan lokalisasi area bodi.</li>
                 <li><b>Proses (Crop Otomatis):</b> Memotong area rusak secara real-time.</li>
                 <li><b>Model 2 (ResNet18+CBAM):</b> Klasifikasi tingkat keparahan geometri kerusakan.</li>
-                <li><b>Output:</b> Visualisasi hasil analisis secara transparan.</li>
+                <li><b>Triase & SOP:</b> Rekomendasi jalur penanganan dan SOP bengkel.</li>
+                <li><b>Laporan PDF:</b> Unduh laporan inspeksi awal untuk dokumentasi.</li>
             </ol>
         </div>
         """, unsafe_allow_html=True)
@@ -189,7 +245,6 @@ def main():
         st.markdown('<hr style="border-top: 1px solid rgba(255,255,255,0.2);">', unsafe_allow_html=True)
         st.markdown('<h3 style="text-align: center; color: #ffffff; margin-bottom: 30px;">Contoh Data Klasifikasi Deteksi Bodi Mobil</h3>', unsafe_allow_html=True)
         
-        # Menggunakan rasio kolom [1, 2, 2, 1] agar gambar di tengah tidak terlalu besar
         col_space1, col_ex1, col_ex2, col_space2 = st.columns([1, 2, 2, 1])
         
         with col_ex1:
@@ -197,7 +252,7 @@ def main():
             if os.path.exists("gambar1.jpg"):
                 st.image("gambar1.jpg", use_container_width=True)
             else:
-                st.info("⚠️ Silakan simpan gambar mobil normal yang Anda kirim ke folder proyek dengan nama file: gambar1.jpg")
+                st.info("Silakan simpan gambar mobil normal ke folder proyek: gambar1.jpg")
                 
         with col_ex2:
             st.markdown('<p style="text-align: center; color: #dddddd; font-size: 1.1rem; font-weight: 600;">Gambar 2: Bodi Rusak</p>', unsafe_allow_html=True)
@@ -208,7 +263,7 @@ def main():
             elif os.path.exists("gambar2.png"):
                 st.image("gambar2.png", use_container_width=True)
             else:
-                st.info("⚠️ Silakan simpan gambar mobil rusak yang Anda kirim ke folder proyek dengan nama file: gambar2.jpg")
+                st.info("Silakan simpan gambar mobil rusak ke folder proyek: gambar2.jpg")
 
         # --- Bagian Support By (Footer) ---
         st.markdown('<div id="support-by"></div>', unsafe_allow_html=True)
@@ -243,7 +298,7 @@ def main():
             </div>
             <div style="text-align: center; color: #ffffff; font-weight: 600; width: 220px;">
                 {img3_tag}
-                <div style="font-size: 1.1rem; line-height: 1.2;">New Atlantis Body Repair<br>& Paint Specialist</div>
+                <div style="font-size: 1.1rem; line-height: 1.2;">New Atlantis Body Repair<br>&amp; Paint Specialist</div>
             </div>
             <div style="text-align: center; color: #ffffff; font-weight: 800; font-size: 2rem; margin-left: 20px; letter-spacing: 1px;">
                 #daridoaibu
@@ -263,21 +318,56 @@ def main():
             # Load image
             image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
             img = cv2.imdecode(image_bytes, 1) # BGR image for processing
-            img_display = img.copy()
+
+            # ===================================================================
+            # STEP 1: IMAGE QUALITY GATEKEEPER
+            # ===================================================================
+            with st.spinner("Memeriksa kualitas gambar..."):
+                gate_result = run_gate(img)
+            
+            gate_status = gate_result["status"]
+            gate_message = gate_result["message"]
+            
+            # Display gate result
+            if gate_status == "rejected_blur":
+                st.error(f"Gambar Ditolak: Gambar terlalu buram untuk dianalisis. "
+                         f"(Skor blur: {gate_result['blur_score']:.1f})")
+                st.warning("Mohon unggah ulang foto yang lebih tajam dan jelas.")
+                st.info(f"Detail: {gate_message}")
+                return  # Stop processing
+            
+            elif gate_status == "enhanced":
+                st.info(f"Peningkatan Kualitas: Gambar gelap terdeteksi dan telah diperbaiki otomatis dengan CLAHE. "
+                        f"(Kecerahan: {gate_result['brightness_score']:.1f})")
+            
+            elif gate_status == "ok":
+                st.success(f"Kualitas gambar baik. (Blur: {gate_result['blur_score']:.1f}, "
+                           f"Kecerahan: {gate_result['brightness_score']:.1f})")
+            
+            # Use the (possibly enhanced) image for further processing
+            img_processed = gate_result["image"]
+            img_original = gate_result["original_image"]
+            img_display = img_processed.copy()
 
             col1, col2 = st.columns([1, 1])
 
             with col1:
                 st.markdown("### Citra Input")
-                st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_container_width=True)
+                if gate_status == "enhanced":
+                    tab_orig, tab_enhanced = st.tabs(["Gambar Asli", "Setelah CLAHE"])
+                    with tab_orig:
+                        st.image(cv2.cvtColor(img_original, cv2.COLOR_BGR2RGB), use_container_width=True)
+                    with tab_enhanced:
+                        st.image(cv2.cvtColor(img_processed, cv2.COLOR_BGR2RGB), use_container_width=True)
+                else:
+                    st.image(cv2.cvtColor(img_processed, cv2.COLOR_BGR2RGB), use_container_width=True)
 
             with col2:
                 st.markdown("### Hasil Analisis")
                 
                 with st.spinner("Melakukan Validasi Objek..."):
                     # Pre-validation using COCO model
-                    val_results = yolo_val.predict(img, conf=0.15)
-                    # COCO classes for vehicles: 2 (car), 3 (motorcycle), 5 (bus), 7 (truck)
+                    val_results = yolo_val.predict(img_processed, conf=0.15)
                     vehicle_classes = [2, 3, 5, 7]
                     
                     is_vehicle = False
@@ -290,8 +380,7 @@ def main():
                     st.error("Validasi Gagal: Sistem tidak mendeteksi adanya mobil pada gambar ini. Mohon unggah citra kendaraan yang benar.")
                 else:
                     with st.spinner("Menjalankan Deteksi YOLOv9c..."):
-                        # Run Custom YOLO
-                        results = yolo_model.predict(img, conf=confidence_threshold)
+                        results = yolo_model.predict(img_processed, conf=confidence_threshold)
                 
                     detections = results[0].boxes
                     
@@ -308,18 +397,15 @@ def main():
                             conf = float(box.conf[0].item())
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                             
-                            # CROP OTOMATIS AREA DETEKSI
-                            # Ensure coordinates are within image bounds
-                            h, w, _ = img.shape
+                            h, w, _ = img_processed.shape
                             x1, y1 = max(0, x1), max(0, y1)
                             x2, y2 = min(w, x2), min(h, y2)
                             
-                            cropped_img = img[y1:y2, x1:x2]
+                            cropped_img = img_processed[y1:y2, x1:x2]
                             
                             if cropped_img.size == 0:
                                 continue
                                 
-                            # Run CNN + ResNet-CBAM Classification for ALL detections
                             input_tensor = preprocess_for_cnn(cropped_img).to(device)
                             with torch.no_grad():
                                 outputs = cnn_model(input_tensor)
@@ -330,7 +416,6 @@ def main():
                             severity_label = CNN_CLASSES.get(pred_class_id, "Unknown")
                             yolo_label_name = "Rusak" if cls_id == 1 else "Normal"
                             
-                            # Store result
                             analysis_results.append({
                                 "ID": f"Deteksi #{i+1}",
                                 "YOLO Deteksi": yolo_label_name,
@@ -339,8 +424,6 @@ def main():
                                 "YOLO Confidence": f"{conf*100:.1f}%"
                             })
                             
-                            # Draw Bounding Box & Label on Image
-                            # Color based on CNN prediction: Green for Class 0 (Ringan/Normal), Red for Class 1 (Parah)
                             color = (0, 0, 255) if pred_class_id == 1 else (0, 255, 0)
                             cv2.rectangle(img_display, (x1, y1), (x2, y2), color, 3)
                             
@@ -348,12 +431,118 @@ def main():
                             (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                             cv2.rectangle(img_display, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
                             cv2.putText(img_display, label_text, (x1+5, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        
+            
                         st.image(cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB), use_container_width=True, caption="Citra dengan Deteksi Kerusakan & Klasifikasi")
                         
                         if len(analysis_results) > 0:
                             st.markdown("#### Rincian Keparahan Geometri (ResNet-CBAM)")
                             st.table(analysis_results)
+                            
+                            # =======================================================
+                            # STEP 2: TRIASE KLAIM & REKOMENDASI SOP
+                            # =======================================================
+                            st.markdown("---")
+                            st.markdown("### Rekomendasi Triase & SOP Bengkel")
+                            
+                            # Compute DSI
+                            dsi_value = compute_dsi(analysis_results)
+                            
+                            # Run triage
+                            triage_result = triage(
+                                dsi=dsi_value,
+                                num_boxes=len(analysis_results),
+                            )
+                            
+                            # Display DSI prominently
+                            dsi_color = triage_result["color"]
+                            st.markdown(f"""
+                            <div style="text-align: center; padding: 15px; border-radius: 10px; 
+                                        background: linear-gradient(135deg, {dsi_color}22, {dsi_color}44);
+                                        border: 2px solid {dsi_color}; margin-bottom: 15px;">
+                                <h2 style="color: {dsi_color}; margin: 0;">Damage Severity Index (DSI)</h2>
+                                <h1 style="color: {dsi_color}; margin: 5px 0; font-size: 3rem;">{dsi_value:.1f}%</h1>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Triage Card (TR-8)
+                            level_lower = triage_result["level"].lower()
+                            card_class = f"triage-{level_lower}"
+                            
+                            st.markdown(f"""
+                            <div class="triage-card {card_class}">
+                                <h3 style="margin-top: 0;">{triage_result["icon"]} Tingkat: {triage_result["level"]} ({triage_result["level_id"]})</h3>
+                                <p><b>Rekomendasi Jalur:</b> {triage_result["path"]}</p>
+                                <p><b>SOP yang Direkomendasikan:</b> {triage_result["sop"]}</p>
+                                <p><b>Estimasi Waktu:</b> {triage_result["estimate"]}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # Override notice (TR-7)
+                            if triage_result["override"]:
+                                st.warning(f"Override Diterapkan: {triage_result['override_reason']}")
+                            
+                            # Disclaimer (TR-5)
+                            disclaimer_text = get_disclaimer()
+                            st.caption(f"*{disclaimer_text}*")
+                            
+                            # =======================================================
+                            # STEP 3: LAPORAN INSPEKSI PDF
+                            # =======================================================
+                            st.markdown("---")
+                            st.markdown("### Unduh Laporan Inspeksi")
+                            
+                            # Save images to temp files for PDF (PD-5)
+                            temp_files = []
+                            try:
+                                original_tmp = _save_temp_image(img_original, prefix="orig_")
+                                temp_files.append(original_tmp)
+                                
+                                annotated_tmp = _save_temp_image(img_display, prefix="annot_")
+                                temp_files.append(annotated_tmp)
+                                
+                                enhanced_tmp = None
+                                if gate_status == "enhanced":
+                                    enhanced_tmp = _save_temp_image(img_processed, prefix="enh_")
+                                    temp_files.append(enhanced_tmp)
+                                
+                                # Build PDF context
+                                report_id = generate_report_id()
+                                from datetime import datetime
+                                timestamp_str = datetime.now().strftime("%d %B %Y, %H:%M:%S WIB")
+                                
+                                pdf_context = {
+                                    "report_id": report_id,
+                                    "timestamp": timestamp_str,
+                                    "original_image_path": original_tmp,
+                                    "annotated_image_path": annotated_tmp,
+                                    "enhanced_image_path": enhanced_tmp,
+                                    "gate_status": gate_status,
+                                    "gate_message": gate_message,
+                                    "detections": analysis_results,
+                                    "dsi": dsi_value,
+                                    "triage_result": triage_result,
+                                    "disclaimer": disclaimer_text,
+                                }
+                                
+                                # Build the PDF (PD-8)
+                                pdf_bytes = build_report(pdf_context)
+                                
+                                # Download button
+                                st.download_button(
+                                    label="Unduh Laporan Inspeksi (PDF)",
+                                    data=pdf_bytes,
+                                    file_name=f"laporan_inspeksi_{report_id}.pdf",
+                                    mime="application/pdf",
+                                    type="primary",
+                                )
+                                
+                                st.caption(f"ID Laporan: `{report_id}`")
+                                
+                            except Exception as e:
+                                st.error(f"Gagal membuat laporan PDF: {str(e)}")
+                            finally:
+                                # Cleanup temp files (PD-9)
+                                cleanup_temp_files(temp_files)
                         else:
                             st.info("Area terdeteksi berstatus 'Normal' (tidak dianalisis keparahannya).")
         else:
