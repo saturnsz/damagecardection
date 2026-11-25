@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fpdf import FPDF
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -28,6 +29,7 @@ _PAGE_W = 210  # A4 width  (mm)
 _PAGE_H = 297  # A4 height (mm)
 _MARGIN = 15
 _CONTENT_W = _PAGE_W - 2 * _MARGIN  # usable width
+_MAX_IMG_H = 95.0  # cap image height so layout remains compact on A4
 
 _FONT = "Helvetica"
 _TITLE_SIZE = 18
@@ -38,6 +40,19 @@ _SMALL_SIZE = 8
 
 _LINE_H = 6  # default line height for body text
 _TABLE_LINE_H = 7
+
+_UNICODE_REPLACEMENTS = {
+    "\u2013": "-",   # en-dash
+    "\u2014": "-",   # em-dash
+    "\u2264": "<=",  # <=
+    "\u2265": ">=",  # >=
+    "\u2192": "->",  # arrow
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2022": "*",   # bullet
+}
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +80,43 @@ def _image_exists(path: Optional[str]) -> bool:
     return bool(path) and os.path.isfile(path)
 
 
+def _sanitize_latin1(text: str) -> str:
+    """Replace unsupported Unicode chars so Helvetica never fails encoding."""
+    for src, dst in _UNICODE_REPLACEMENTS.items():
+        text = text.replace(src, dst)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def _safe_str(value: Any) -> str:
-    """Convert *value* to str, returning ``'-'`` for None / empty."""
+    """Convert *value* to latin-1 safe str, returning ``'-'`` for None / empty."""
     if value is None:
         return "-"
-    s = str(value)
+    s = _sanitize_latin1(str(value)).strip()
     return s if s else "-"
+
+
+def _fit_image_box(path: str, max_w: float, max_h: float = _MAX_IMG_H) -> Tuple[float, float]:
+    """Compute (width, height) in mm preserving aspect ratio within max_w x max_h."""
+    try:
+        with Image.open(path) as im:
+            px_w, px_h = im.size
+        if px_w <= 0 or px_h <= 0:
+            return max_w, max_w * 0.75
+        ratio = px_h / px_w
+        w = max_w
+        h = w * ratio
+        if h > max_h:
+            h = max_h
+            w = h / ratio
+        return w, h
+    except Exception:
+        return max_w, min(max_h, max_w * 0.75)
+
+
+def _ensure_space(pdf: FPDF, needed_h: float) -> None:
+    """Add a page if remaining vertical space is less than *needed_h*."""
+    if pdf.get_y() + needed_h > _PAGE_H - _MARGIN:
+        pdf.add_page()
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +130,6 @@ class _ReportPDF(FPDF):
         super().__init__(**kwargs)
         self._report_id = report_id
 
-    # Optional footer with page number
     def footer(self):  # noqa: D401
         self.set_y(-12)
         self.set_font(_FONT, "I", _SMALL_SIZE)
@@ -114,30 +159,29 @@ def build_report(context: Dict[str, Any]) -> bytes:
     gate_status: str = _safe_str(context.get("gate_status"))
     gate_message: str = _safe_str(context.get("gate_message"))
     detections: List[Dict[str, Any]] = context.get("detections", [])
-    dsi: float = context.get("dsi", 0.0)
+    dsi: float = float(context.get("dsi", 0.0))
     triage: Dict[str, Any] = context.get("triage_result", {})
     disclaimer: str = _safe_str(context.get("disclaimer"))
 
     pdf = _ReportPDF(report_id=report_id, orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=_MARGIN)
     pdf.alias_nb_pages()
-    pdf.add_page()
     pdf.set_margins(_MARGIN, _MARGIN, _MARGIN)
+    pdf.add_page()
 
     # -----------------------------------------------------------------------
     # 1. HEADER  (PD-2)
     # -----------------------------------------------------------------------
     pdf.set_font(_FONT, "B", _TITLE_SIZE)
-    pdf.cell(0, 10, "LAPORAN INSPEKSI AWAL", ln=True, align="C")
+    pdf.cell(0, 10, "LAPORAN INSPEKSI AWAL", new_x="LMARGIN", new_y="NEXT", align="C")
 
     pdf.set_font(_FONT, "", _SUBTITLE_SIZE)
-    pdf.cell(0, 7, "Sistem Deteksi Kerusakan Bodi Mobil", ln=True, align="C")
+    pdf.cell(0, 7, "Sistem Deteksi Kerusakan Bodi Mobil", new_x="LMARGIN", new_y="NEXT", align="C")
 
     pdf.ln(2)
     pdf.set_font(_FONT, "", _SMALL_SIZE)
-    pdf.cell(0, 5, f"Report ID: {report_id}   |   Waktu: {timestamp}", ln=True, align="R")
+    pdf.cell(0, 5, f"Report ID: {report_id}   |   Waktu: {timestamp}", new_x="LMARGIN", new_y="NEXT", align="R")
 
-    # horizontal rule
     y_line = pdf.get_y() + 1
     pdf.set_draw_color(60, 60, 60)
     pdf.set_line_width(0.5)
@@ -149,20 +193,19 @@ def build_report(context: Dict[str, Any]) -> bytes:
     # -----------------------------------------------------------------------
     _section_heading(pdf, "1. Kualitas Gambar")
 
-    pdf.set_font(_FONT, "B", _BODY_SIZE)
-    pdf.cell(35, _LINE_H, "Status:")
-    pdf.set_font(_FONT, "", _BODY_SIZE)
-    pdf.cell(0, _LINE_H, gate_status.upper(), ln=True)
-
-    pdf.set_font(_FONT, "B", _BODY_SIZE)
-    pdf.cell(35, _LINE_H, "Pesan:")
-    pdf.set_font(_FONT, "", _BODY_SIZE)
-    pdf.multi_cell(0, _LINE_H, gate_message)
+    _kv_row(pdf, "Status:", gate_status.upper())
+    _kv_row(pdf, "Pesan:", gate_message)
 
     if gate_status.lower() == "enhanced":
         pdf.set_font(_FONT, "I", _SMALL_SIZE)
         pdf.set_text_color(100, 100, 100)
-        pdf.cell(0, _LINE_H, "* Peningkatan kualitas CLAHE telah diterapkan pada gambar.", ln=True)
+        pdf.cell(
+            0,
+            _LINE_H,
+            "* Peningkatan kualitas CLAHE telah diterapkan pada gambar.",
+            new_x="LMARGIN",
+            new_y="NEXT",
+        )
         pdf.set_text_color(0, 0, 0)
 
     pdf.ln(3)
@@ -176,95 +219,100 @@ def build_report(context: Dict[str, Any]) -> bytes:
     has_annotated = _image_exists(annotated_path)
     has_enhanced = _image_exists(enhanced_path)
 
-    # Decide image width — two side-by-side when both exist
     img_w_half = (_CONTENT_W - 4) / 2  # 4 mm gap
     img_w_full = _CONTENT_W
 
     if has_original and has_annotated:
-        x_start = pdf.get_x()
-        y_start = pdf.get_y()
+        w1, h1 = _fit_image_box(original_path, img_w_half)
+        w2, h2 = _fit_image_box(annotated_path, img_w_half)
+        max_h = max(h1, h2)
 
-        # Label + image — Original
+        _ensure_space(pdf, 7 + max_h + 4)
+
         pdf.set_font(_FONT, "B", _SMALL_SIZE)
-        pdf.cell(img_w_half, 5, "Gambar Asli", ln=False, align="C")
-        pdf.cell(4, 5, "")  # gap
-        pdf.cell(img_w_half, 5, "Hasil Deteksi", ln=True, align="C")
+        pdf.cell(img_w_half, 5, "Gambar Asli", new_x="RIGHT", new_y="TOP", align="C")
+        pdf.cell(4, 5, "", new_x="RIGHT", new_y="TOP")
+        pdf.cell(img_w_half, 5, "Hasil Deteksi", new_x="LMARGIN", new_y="NEXT", align="C")
 
-        y_img = pdf.get_y()
+        y_img = pdf.get_y() + 1
+        x1 = _MARGIN + (img_w_half - w1) / 2
+        x2 = _MARGIN + img_w_half + 4 + (img_w_half - w2) / 2
+
         try:
-            pdf.image(original_path, x=_MARGIN, y=y_img, w=img_w_half)
+            pdf.image(original_path, x=x1, y=y_img, w=w1)
         except Exception:
             pass
         try:
-            info = pdf.image(annotated_path, x=_MARGIN + img_w_half + 4, y=y_img, w=img_w_half)
+            pdf.image(annotated_path, x=x2, y=y_img, w=w2)
         except Exception:
-            info = None
+            pass
 
-        # Advance Y past whichever image is taller
-        # fpdf2 image() returns an object; we estimate height from width ratio
-        img_h_est = img_w_half * 0.75  # 4:3 fallback
-        pdf.set_y(y_img + img_h_est + 3)
+        pdf.set_y(y_img + max_h + 4)
     elif has_original:
+        w1, h1 = _fit_image_box(original_path, img_w_full)
+        _ensure_space(pdf, 7 + h1 + 4)
         pdf.set_font(_FONT, "B", _SMALL_SIZE)
-        pdf.cell(0, 5, "Gambar Asli", ln=True, align="C")
+        pdf.cell(0, 5, "Gambar Asli", new_x="LMARGIN", new_y="NEXT", align="C")
+        y_img = pdf.get_y() + 1
         try:
-            pdf.image(original_path, x=_MARGIN, w=img_w_full)
+            pdf.image(original_path, x=_MARGIN + (img_w_full - w1) / 2, y=y_img, w=w1)
         except Exception:
             pass
-        pdf.ln(3)
+        pdf.set_y(y_img + h1 + 4)
     elif has_annotated:
+        w2, h2 = _fit_image_box(annotated_path, img_w_full)
+        _ensure_space(pdf, 7 + h2 + 4)
         pdf.set_font(_FONT, "B", _SMALL_SIZE)
-        pdf.cell(0, 5, "Hasil Deteksi", ln=True, align="C")
+        pdf.cell(0, 5, "Hasil Deteksi", new_x="LMARGIN", new_y="NEXT", align="C")
+        y_img = pdf.get_y() + 1
         try:
-            pdf.image(annotated_path, x=_MARGIN, w=img_w_full)
+            pdf.image(annotated_path, x=_MARGIN + (img_w_full - w2) / 2, y=y_img, w=w2)
         except Exception:
             pass
-        pdf.ln(3)
+        pdf.set_y(y_img + h2 + 4)
 
-    # Enhanced image (full width, below the pair)
     if has_enhanced:
+        we, he = _fit_image_box(enhanced_path, img_w_half, max_h=75.0)
+        _ensure_space(pdf, 8 + he + 4)
         pdf.ln(2)
         pdf.set_font(_FONT, "B", _SMALL_SIZE)
-        pdf.cell(0, 5, "Gambar Setelah Peningkatan (CLAHE)", ln=True, align="C")
+        pdf.cell(0, 5, "Gambar Setelah Peningkatan (CLAHE)", new_x="LMARGIN", new_y="NEXT", align="C")
+        y_img = pdf.get_y() + 1
         try:
-            pdf.image(enhanced_path, x=_MARGIN + img_w_half / 2, w=img_w_half)
+            pdf.image(enhanced_path, x=_MARGIN + (_CONTENT_W - we) / 2, y=y_img, w=we)
         except Exception:
             pass
-        pdf.ln(3)
+        pdf.set_y(y_img + he + 4)
 
-    pdf.ln(3)
+    pdf.ln(2)
 
     # -----------------------------------------------------------------------
     # 4. Hasil Deteksi  (PD-1)
     # -----------------------------------------------------------------------
+    _ensure_space(pdf, 30)
     _section_heading(pdf, "3. Hasil Deteksi")
 
     if detections:
-        col_widths = [12, 42, 38, 32, 32]  # must sum ~ _CONTENT_W  (156 ~= 180-24 padded)
-        # Adjust to fill content width
+        col_widths = [24, 34, 46, 26, 26]
         total_cw = sum(col_widths)
         scale = _CONTENT_W / total_cw
         col_widths = [round(w * scale, 1) for w in col_widths]
 
         headers = ["ID", "YOLO Deteksi", "CNN Keparahan", "CNN Conf.", "YOLO Conf."]
 
-        # Table header
         pdf.set_font(_FONT, "B", _SMALL_SIZE)
         pdf.set_fill_color(50, 50, 50)
         pdf.set_text_color(255, 255, 255)
         for i, hdr in enumerate(headers):
-            pdf.cell(col_widths[i], _TABLE_LINE_H, hdr, border=1, fill=True, align="C")
-        pdf.ln()
+            nx = "LMARGIN" if i == len(headers) - 1 else "RIGHT"
+            ny = "NEXT" if i == len(headers) - 1 else "TOP"
+            pdf.cell(col_widths[i], _TABLE_LINE_H, hdr, border=1, fill=True, align="C", new_x=nx, new_y=ny)
         pdf.set_text_color(0, 0, 0)
 
-        # Table rows
         pdf.set_font(_FONT, "", _SMALL_SIZE)
         fill = False
         for det in detections:
-            if fill:
-                pdf.set_fill_color(235, 235, 235)
-            else:
-                pdf.set_fill_color(255, 255, 255)
+            pdf.set_fill_color(235, 235, 235) if fill else pdf.set_fill_color(255, 255, 255)
 
             row = [
                 _safe_str(det.get("ID")),
@@ -275,25 +323,26 @@ def build_report(context: Dict[str, Any]) -> bytes:
             ]
             for i, val in enumerate(row):
                 align = "C" if i == 0 else ("L" if i <= 2 else "C")
-                pdf.cell(col_widths[i], _TABLE_LINE_H, val, border=1, fill=True, align=align)
-            pdf.ln()
+                nx = "LMARGIN" if i == len(row) - 1 else "RIGHT"
+                ny = "NEXT" if i == len(row) - 1 else "TOP"
+                pdf.cell(col_widths[i], _TABLE_LINE_H, val, border=1, fill=True, align=align, new_x=nx, new_y=ny)
             fill = not fill
     else:
         pdf.set_font(_FONT, "I", _BODY_SIZE)
-        pdf.cell(0, _LINE_H, "Tidak ada kerusakan terdeteksi.", ln=True)
+        pdf.cell(0, _LINE_H, "Tidak ada kerusakan terdeteksi.", new_x="LMARGIN", new_y="NEXT")
 
     pdf.ln(3)
 
-    # DSI
     pdf.set_font(_FONT, "B", _SECTION_SIZE)
     pdf.set_fill_color(240, 240, 240)
     dsi_text = f"Damage Severity Index (DSI): {dsi:.1f}%"
-    pdf.cell(0, 10, dsi_text, ln=True, align="C", fill=True, border=1)
+    pdf.cell(0, 10, dsi_text, new_x="LMARGIN", new_y="NEXT", align="C", fill=True, border=1)
     pdf.ln(4)
 
     # -----------------------------------------------------------------------
     # 5. Rekomendasi Triase  (PD-1, TR-5)
     # -----------------------------------------------------------------------
+    _ensure_space(pdf, 45)
     _section_heading(pdf, "4. Rekomendasi Jalur")
 
     level = _safe_str(triage.get("level"))
@@ -301,12 +350,12 @@ def build_report(context: Dict[str, Any]) -> bytes:
     path = _safe_str(triage.get("path"))
     sop = _safe_str(triage.get("sop"))
     estimate = _safe_str(triage.get("estimate"))
-    override = triage.get("override", False)
+    override = bool(triage.get("override", False))
     override_reason = _safe_str(triage.get("override_reason"))
     original_level = _safe_str(triage.get("original_level"))
 
     _kv_row(pdf, "Level:", f"{level} ({level_id})")
-    _kv_row(pdf, "Jalur:", path)
+    _kv_row(pdf, "Rekomendasi Jalur:", path)
     _kv_row(pdf, "SOP:", sop)
     _kv_row(pdf, "Estimasi:", estimate)
 
@@ -314,7 +363,7 @@ def build_report(context: Dict[str, Any]) -> bytes:
         pdf.ln(2)
         pdf.set_font(_FONT, "B", _BODY_SIZE)
         pdf.set_text_color(180, 0, 0)
-        pdf.cell(0, _LINE_H, "* Override diterapkan", ln=True)
+        pdf.cell(0, _LINE_H, "* Override diterapkan", new_x="LMARGIN", new_y="NEXT")
         pdf.set_text_color(0, 0, 0)
         _kv_row(pdf, "Level Awal:", original_level)
         _kv_row(pdf, "Alasan Override:", override_reason)
@@ -324,35 +373,30 @@ def build_report(context: Dict[str, Any]) -> bytes:
     # -----------------------------------------------------------------------
     # 6. Disclaimer  (PD-3)
     # -----------------------------------------------------------------------
+    _ensure_space(pdf, 28)
     _section_heading(pdf, "5. Disclaimer")
     pdf.set_font(_FONT, "I", _SMALL_SIZE)
     pdf.set_text_color(80, 80, 80)
-    pdf.multi_cell(0, _LINE_H - 1, disclaimer)
+    pdf.multi_cell(0, _LINE_H - 1, disclaimer, new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
     pdf.ln(6)
 
     # -----------------------------------------------------------------------
     # 7. Kolom Tanda Tangan  (PD-7)
     # -----------------------------------------------------------------------
+    _ensure_space(pdf, 55)
     _section_heading(pdf, "6. Tanda Tangan")
 
-    sig_w = (_CONTENT_W - 20) / 2  # two columns with a gap
+    sig_w = (_CONTENT_W - 20) / 2
     y_sig = pdf.get_y() + 2
-
-    # Ensure enough space for signature block; force new page if near bottom
-    if y_sig + 40 > _PAGE_H - _MARGIN:
-        pdf.add_page()
-        y_sig = pdf.get_y() + 2
 
     for i, role in enumerate(["Pemeriksa", "Penerima"]):
         x_col = _MARGIN + i * (sig_w + 20)
 
         pdf.set_xy(x_col, y_sig)
         pdf.set_font(_FONT, "B", _BODY_SIZE)
-        pdf.cell(sig_w, _LINE_H, role, align="C", ln=True)
+        pdf.cell(sig_w, _LINE_H, role, align="C")
 
-        # space for signature
-        pdf.set_xy(x_col, y_sig + 25)
         pdf.set_draw_color(0, 0, 0)
         pdf.line(x_col + 10, y_sig + 25, x_col + sig_w - 10, y_sig + 25)
 
@@ -363,9 +407,6 @@ def build_report(context: Dict[str, Any]) -> bytes:
         pdf.set_xy(x_col, y_sig + 33)
         pdf.cell(sig_w, _LINE_H, "Tanggal: __________________", align="C")
 
-    # -----------------------------------------------------------------------
-    # Output
-    # -----------------------------------------------------------------------
     return bytes(pdf.output())
 
 
@@ -375,20 +416,22 @@ def build_report(context: Dict[str, Any]) -> bytes:
 
 def _section_heading(pdf: FPDF, title: str) -> None:
     """Draw a coloured section heading bar."""
+    pdf.set_x(_MARGIN)
     pdf.set_font(_FONT, "B", _SECTION_SIZE)
     pdf.set_fill_color(30, 80, 160)
     pdf.set_text_color(255, 255, 255)
-    pdf.cell(0, 8, f"  {title}", ln=True, fill=True)
+    pdf.cell(0, 8, f"  {_safe_str(title)}", new_x="LMARGIN", new_y="NEXT", fill=True)
     pdf.set_text_color(0, 0, 0)
     pdf.ln(2)
 
 
 def _kv_row(pdf: FPDF, key: str, value: str) -> None:
     """Print a bold *key* followed by a normal *value*."""
+    pdf.set_x(_MARGIN)
     pdf.set_font(_FONT, "B", _BODY_SIZE)
-    pdf.cell(35, _LINE_H, key)
+    pdf.cell(38, _LINE_H, _safe_str(key), new_x="RIGHT", new_y="TOP")
     pdf.set_font(_FONT, "", _BODY_SIZE)
-    pdf.multi_cell(0, _LINE_H, value)
+    pdf.multi_cell(0, _LINE_H, _safe_str(value), new_x="LMARGIN", new_y="NEXT")
 
 
 def _fmt_conf(value: Any) -> str:
@@ -397,7 +440,6 @@ def _fmt_conf(value: Any) -> str:
         return "-"
     try:
         v = float(value)
-        # If already 0-1 range, convert to percentage
         if v <= 1.0:
             return f"{v * 100:.1f}%"
         return f"{v:.1f}%"

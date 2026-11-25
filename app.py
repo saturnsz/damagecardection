@@ -3,8 +3,10 @@ import cv2
 import torch
 import numpy as np
 import base64
+import hashlib
 import os
 import tempfile
+from datetime import datetime
 from PIL import Image
 from ultralytics import YOLO
 from torchvision import transforms
@@ -94,6 +96,7 @@ st.markdown("""
         color: #fff;
         font-weight: 500;
     }
+    .triage-card h3 { color: inherit; }
     .triage-minor { background: linear-gradient(135deg, #28a745, #20c997); }
     .triage-moderate { background: linear-gradient(135deg, #ffc107, #fd7e14); color: #333; }
     .triage-severe { background: linear-gradient(135deg, #dc3545, #c82333); }
@@ -153,10 +156,17 @@ def set_background(image_path):
         )
 
 # --- Helper: Save image to temp file for PDF ---
-def _save_temp_image(image_bgr, prefix="img"):
-    """Save a BGR image to a temporary JPEG file. Returns the path."""
+def _save_temp_image(image_bgr, prefix="img", max_dim=1600):
+    """Downscale if oversized and save BGR image to temp JPEG for compact PDF (PD-5)."""
+    h, w = image_bgr.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        image_bgr = cv2.resize(
+            image_bgr,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
     tmp = tempfile.NamedTemporaryFile(suffix=".jpg", prefix=prefix, delete=False)
-    # Compress to keep PDF small (PD-5)
     cv2.imwrite(tmp.name, image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
     tmp.close()
     return tmp.name
@@ -165,8 +175,8 @@ def _save_temp_image(image_bgr, prefix="img"):
 def compute_dsi(analysis_results):
     """Compute Damage Severity Index as a percentage.
     
-    DSI = (number of 'Parah / Severe' detections / total detections) * 100
-    combined with average CNN confidence for severe detections.
+    DSI = (number of 'Rusak' / severe detections / total detections) * 100
+    weighted by average CNN confidence for those detections.
     """
     if not analysis_results:
         return 0.0
@@ -176,7 +186,7 @@ def compute_dsi(analysis_results):
     severe_conf_sum = 0.0
     
     for det in analysis_results:
-        if "Parah" in det.get("CNN Keparahan", "") or "Severe" in det.get("CNN Keparahan", ""):
+        if "Rusak" in det.get("CNN Keparahan", "") or "Parah" in det.get("CNN Keparahan", "") or "Severe" in det.get("CNN Keparahan", ""):
             severe_count += 1
             conf_str = det.get("CNN Confidence", "0%").replace("%", "")
             try:
@@ -197,7 +207,7 @@ def compute_dsi(analysis_results):
     return min(100.0, max(0.0, dsi))
 
 # --- Labels Mapping ---
-CNN_CLASSES = {0: "Ringan / Minor", 1: "Parah / Severe"}
+CNN_CLASSES = {0: "Ringan / Minor", 1: "Rusak"}
 YOLO_TARGET_CLASS = 1 # 'Rusak' is index 1
 
 # --- Main App ---
@@ -315,39 +325,182 @@ def main():
         confidence_threshold = st.sidebar.slider("YOLO Confidence Threshold", min_value=0.1, max_value=1.0, value=0.25, step=0.05)
 
         if uploaded_file is not None:
-            # Load image
-            image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            img = cv2.imdecode(image_bytes, 1) # BGR image for processing
+            raw_bytes = uploaded_file.getvalue()
+            analysis_key = f"{hashlib.md5(raw_bytes).hexdigest()}_{confidence_threshold:.2f}"
 
-            # ===================================================================
-            # STEP 1: IMAGE QUALITY GATEKEEPER
-            # ===================================================================
-            with st.spinner("Memeriksa kualitas gambar..."):
-                gate_result = run_gate(img)
-            
+            if st.session_state.get("analysis_key") != analysis_key:
+                image_bytes = np.asarray(bytearray(raw_bytes), dtype=np.uint8)
+                img = cv2.imdecode(image_bytes, 1)  # BGR image for processing
+
+                if img is None:
+                    st.error("File gambar tidak dapat dibaca atau rusak. Mohon unggah file JPG/JPEG/PNG yang valid.")
+                    return
+
+                # STEP 1: IMAGE QUALITY GATEKEEPER
+                with st.spinner("Memeriksa kualitas gambar..."):
+                    gate_result = run_gate(img)
+
+                cache = {
+                    "gate_result": gate_result,
+                    "is_vehicle": None,
+                    "num_raw_detections": 0,
+                    "img_display": None,
+                    "analysis_results": [],
+                    "dsi_value": 0.0,
+                    "triage_result": None,
+                    "disclaimer_text": "",
+                    "report_id": None,
+                    "pdf_bytes": None,
+                    "pdf_error": None,
+                }
+
+                if gate_result["status"] != "rejected_blur":
+                    img_processed = gate_result["image"]
+                    img_original = gate_result["original_image"]
+                    img_display = img_processed.copy()
+
+                    with st.spinner("Melakukan Validasi Objek..."):
+                        val_results = yolo_val.predict(img_processed, conf=0.15)
+                        vehicle_classes = [2, 3, 5, 7]
+                        is_vehicle = any(
+                            int(box.cls[0].item()) in vehicle_classes
+                            for box in val_results[0].boxes
+                        )
+
+                    cache["is_vehicle"] = is_vehicle
+
+                    if is_vehicle:
+                        with st.spinner("Menjalankan Deteksi YOLOv9c..."):
+                            results = yolo_model.predict(img_processed, conf=confidence_threshold)
+
+                        detections = results[0].boxes
+                        cache["num_raw_detections"] = len(detections)
+
+                        if len(detections) > 0:
+                            analysis_results = []
+                            detected_classes = []
+
+                            for i, box in enumerate(detections):
+                                cls_id = int(box.cls[0].item())
+                                conf = float(box.conf[0].item())
+                                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+                                h, w, _ = img_processed.shape
+                                x1, y1 = max(0, x1), max(0, y1)
+                                x2, y2 = min(w, x2), min(h, y2)
+
+                                cropped_img = img_processed[y1:y2, x1:x2]
+                                if cropped_img.size == 0:
+                                    continue
+
+                                input_tensor = preprocess_for_cnn(cropped_img).to(device)
+                                with torch.no_grad():
+                                    outputs = cnn_model(input_tensor)
+                                    probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                                    pred_class_id = torch.argmax(probabilities, dim=1).item()
+                                    pred_confidence = probabilities[0][pred_class_id].item()
+
+                                severity_label = CNN_CLASSES.get(pred_class_id, "Unknown")
+                                yolo_label_name = "Rusak" if cls_id == 1 else "Normal"
+                                detected_classes.append(yolo_label_name)
+
+                                analysis_results.append({
+                                    "ID": f"Deteksi #{i+1}",
+                                    "YOLO Deteksi": yolo_label_name,
+                                    "CNN Keparahan": severity_label,
+                                    "CNN Confidence": f"{pred_confidence*100:.1f}%",
+                                    "YOLO Confidence": f"{conf*100:.1f}%",
+                                })
+
+                                color = (0, 0, 255) if pred_class_id == 1 else (0, 255, 0)
+                                cv2.rectangle(img_display, (x1, y1), (x2, y2), color, 3)
+
+                                label_text = f"#{i+1}: {severity_label}"
+                                (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                                cv2.rectangle(img_display, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
+                                cv2.putText(img_display, label_text, (x1+5, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                            cache["img_display"] = img_display
+                            cache["analysis_results"] = analysis_results
+
+                            if analysis_results:
+                                dsi_value = compute_dsi(analysis_results)
+                                triage_result = triage(
+                                    dsi=dsi_value,
+                                    num_boxes=len(analysis_results),
+                                    classes=detected_classes,
+                                )
+                                disclaimer_text = get_disclaimer()
+                                cache["dsi_value"] = dsi_value
+                                cache["triage_result"] = triage_result
+                                cache["disclaimer_text"] = disclaimer_text
+
+                                # Build PDF once and cache bytes in session_state
+                                temp_files = []
+                                try:
+                                    original_tmp = _save_temp_image(img_original, prefix="orig_")
+                                    temp_files.append(original_tmp)
+
+                                    annotated_tmp = _save_temp_image(img_display, prefix="annot_")
+                                    temp_files.append(annotated_tmp)
+
+                                    enhanced_tmp = None
+                                    if gate_result["status"] == "enhanced":
+                                        enhanced_tmp = _save_temp_image(img_processed, prefix="enh_")
+                                        temp_files.append(enhanced_tmp)
+
+                                    report_id = generate_report_id()
+                                    timestamp_str = datetime.now().strftime("%d %B %Y, %H:%M:%S WIB")
+
+                                    pdf_context = {
+                                        "report_id": report_id,
+                                        "timestamp": timestamp_str,
+                                        "original_image_path": original_tmp,
+                                        "annotated_image_path": annotated_tmp,
+                                        "enhanced_image_path": enhanced_tmp,
+                                        "gate_status": gate_result["status"],
+                                        "gate_message": gate_result["message"],
+                                        "detections": analysis_results,
+                                        "dsi": dsi_value,
+                                        "triage_result": triage_result,
+                                        "disclaimer": disclaimer_text,
+                                    }
+                                    cache["report_id"] = report_id
+                                    cache["pdf_bytes"] = build_report(pdf_context)
+                                except Exception as e:
+                                    cache["pdf_error"] = str(e)
+                                finally:
+                                    cleanup_temp_files(temp_files)
+
+                st.session_state["analysis_key"] = analysis_key
+                st.session_state["analysis_cache"] = cache
+
+            cache = st.session_state["analysis_cache"]
+            gate_result = cache["gate_result"]
             gate_status = gate_result["status"]
             gate_message = gate_result["message"]
-            
-            # Display gate result
+
             if gate_status == "rejected_blur":
-                st.error(f"Gambar Ditolak: Gambar terlalu buram untuk dianalisis. "
-                         f"(Skor blur: {gate_result['blur_score']:.1f})")
+                st.error(
+                    f"Gambar Ditolak: Gambar terlalu buram untuk dianalisis. "
+                    f"(Skor blur: {gate_result['blur_score']:.1f})"
+                )
                 st.warning("Mohon unggah ulang foto yang lebih tajam dan jelas.")
                 st.info(f"Detail: {gate_message}")
-                return  # Stop processing
-            
+                return
             elif gate_status == "enhanced":
-                st.info(f"Peningkatan Kualitas: Gambar gelap terdeteksi dan telah diperbaiki otomatis dengan CLAHE. "
-                        f"(Kecerahan: {gate_result['brightness_score']:.1f})")
-            
+                st.info(
+                    f"Peningkatan Kualitas: Gambar gelap terdeteksi dan telah diperbaiki otomatis dengan CLAHE. "
+                    f"(Kecerahan: {gate_result['brightness_score']:.1f})"
+                )
             elif gate_status == "ok":
-                st.success(f"Kualitas gambar baik. (Blur: {gate_result['blur_score']:.1f}, "
-                           f"Kecerahan: {gate_result['brightness_score']:.1f})")
-            
-            # Use the (possibly enhanced) image for further processing
+                st.success(
+                    f"Kualitas gambar baik. (Blur: {gate_result['blur_score']:.1f}, "
+                    f"Kecerahan: {gate_result['brightness_score']:.1f})"
+                )
+
             img_processed = gate_result["image"]
             img_original = gate_result["original_image"]
-            img_display = img_processed.copy()
 
             col1, col2 = st.columns([1, 1])
 
@@ -364,187 +517,80 @@ def main():
 
             with col2:
                 st.markdown("### Hasil Analisis")
-                
-                with st.spinner("Melakukan Validasi Objek..."):
-                    # Pre-validation using COCO model
-                    val_results = yolo_val.predict(img_processed, conf=0.15)
-                    vehicle_classes = [2, 3, 5, 7]
-                    
-                    is_vehicle = False
-                    for box in val_results[0].boxes:
-                        if int(box.cls[0].item()) in vehicle_classes:
-                            is_vehicle = True
-                            break
-                
-                if not is_vehicle:
+
+                if not cache["is_vehicle"]:
                     st.error("Validasi Gagal: Sistem tidak mendeteksi adanya mobil pada gambar ini. Mohon unggah citra kendaraan yang benar.")
+                elif cache["num_raw_detections"] == 0:
+                    st.error("YOLOv9c tidak mendeteksi bodi/kerusakan pada gambar ini dengan confidence tersebut. Coba turunkan slider.")
                 else:
-                    with st.spinner("Menjalankan Deteksi YOLOv9c..."):
-                        results = yolo_model.predict(img_processed, conf=confidence_threshold)
-                
-                    detections = results[0].boxes
-                    
-                    if len(detections) == 0:
-                        st.error("YOLOv9c tidak mendeteksi bodi/kerusakan pada gambar ini dengan confidence tersebut. Coba turunkan slider.")
-                    else:
-                        st.success(f"Ditemukan {len(detections)} deteksi area pada mobil.")
-                        
-                        analysis_results = []
-                        
-                        # Process each detection
-                        for i, box in enumerate(detections):
-                            cls_id = int(box.cls[0].item())
-                            conf = float(box.conf[0].item())
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            
-                            h, w, _ = img_processed.shape
-                            x1, y1 = max(0, x1), max(0, y1)
-                            x2, y2 = min(w, x2), min(h, y2)
-                            
-                            cropped_img = img_processed[y1:y2, x1:x2]
-                            
-                            if cropped_img.size == 0:
-                                continue
-                                
-                            input_tensor = preprocess_for_cnn(cropped_img).to(device)
-                            with torch.no_grad():
-                                outputs = cnn_model(input_tensor)
-                                probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                                pred_class_id = torch.argmax(probabilities, dim=1).item()
-                                pred_confidence = probabilities[0][pred_class_id].item()
-                                
-                            severity_label = CNN_CLASSES.get(pred_class_id, "Unknown")
-                            yolo_label_name = "Rusak" if cls_id == 1 else "Normal"
-                            
-                            analysis_results.append({
-                                "ID": f"Deteksi #{i+1}",
-                                "YOLO Deteksi": yolo_label_name,
-                                "CNN Keparahan": severity_label,
-                                "CNN Confidence": f"{pred_confidence*100:.1f}%",
-                                "YOLO Confidence": f"{conf*100:.1f}%"
-                            })
-                            
-                            color = (0, 0, 255) if pred_class_id == 1 else (0, 255, 0)
-                            cv2.rectangle(img_display, (x1, y1), (x2, y2), color, 3)
-                            
-                            label_text = f"#{i+1}: {severity_label}"
-                            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                            cv2.rectangle(img_display, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
-                            cv2.putText(img_display, label_text, (x1+5, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-            
-                        st.image(cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB), use_container_width=True, caption="Citra dengan Deteksi Kerusakan & Klasifikasi")
-                        
-                        if len(analysis_results) > 0:
-                            st.markdown("#### Rincian Keparahan Geometri (ResNet-CBAM)")
-                            st.table(analysis_results)
-                            
-                            # =======================================================
-                            # STEP 2: TRIASE KLAIM & REKOMENDASI SOP
-                            # =======================================================
-                            st.markdown("---")
-                            st.markdown("### Rekomendasi Triase & SOP Bengkel")
-                            
-                            # Compute DSI
-                            dsi_value = compute_dsi(analysis_results)
-                            
-                            # Run triage
-                            triage_result = triage(
-                                dsi=dsi_value,
-                                num_boxes=len(analysis_results),
+                    st.success(f"Ditemukan {cache['num_raw_detections']} deteksi area pada mobil.")
+                    img_display = cache["img_display"]
+                    analysis_results = cache["analysis_results"]
+
+                    if img_display is not None:
+                        st.image(
+                            cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB),
+                            use_container_width=True,
+                            caption="Citra dengan Deteksi Kerusakan & Klasifikasi",
+                        )
+
+                    if analysis_results:
+                        st.markdown("#### Rincian Keparahan Geometri (ResNet-CBAM)")
+                        st.table(analysis_results)
+
+                        # STEP 2: TRIASE KLAIM & REKOMENDASI SOP
+                        st.markdown("---")
+                        st.markdown("### Rekomendasi Triase & SOP Bengkel")
+
+                        dsi_value = cache["dsi_value"]
+                        triage_result = cache["triage_result"]
+                        disclaimer_text = cache["disclaimer_text"]
+                        dsi_color = triage_result["color"]
+
+                        st.markdown(f"""
+                        <div style="text-align: center; padding: 15px; border-radius: 10px; 
+                                    background: rgba(0, 0, 0, 0.55);
+                                    border: 2px solid {dsi_color}; margin-bottom: 15px;">
+                            <h2 style="color: {dsi_color}; margin: 0;">Damage Severity Index (DSI)</h2>
+                            <h1 style="color: {dsi_color}; margin: 5px 0; font-size: 3rem;">{dsi_value:.1f}%</h1>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        level_lower = triage_result["level"].lower()
+                        card_class = f"triage-{level_lower}"
+
+                        st.markdown(f"""
+                        <div class="triage-card {card_class}">
+                            <h3 style="margin-top: 0;">{triage_result["icon"]} Tingkat: {triage_result["level"]} ({triage_result["level_id"]})</h3>
+                            <p><b>Rekomendasi Jalur:</b> {triage_result["path"]}</p>
+                            <p><b>SOP yang Direkomendasikan:</b> {triage_result["sop"]}</p>
+                            <p><b>Estimasi Waktu:</b> {triage_result["estimate"]}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        if triage_result["override"]:
+                            st.warning(f"Override Diterapkan: {triage_result['override_reason']}")
+
+                        st.caption(f"*{disclaimer_text}*")
+
+                        # STEP 3: LAPORAN INSPEKSI PDF
+                        st.markdown("---")
+                        st.markdown("### Unduh Laporan Inspeksi")
+
+                        if cache["pdf_error"]:
+                            st.error(f"Gagal membuat laporan PDF: {cache['pdf_error']}")
+                        elif cache["pdf_bytes"] is not None:
+                            report_id = cache["report_id"]
+                            st.download_button(
+                                label="Unduh Laporan Inspeksi (PDF)",
+                                data=cache["pdf_bytes"],
+                                file_name=f"laporan_inspeksi_{report_id}.pdf",
+                                mime="application/pdf",
+                                type="primary",
                             )
-                            
-                            # Display DSI prominently
-                            dsi_color = triage_result["color"]
-                            st.markdown(f"""
-                            <div style="text-align: center; padding: 15px; border-radius: 10px; 
-                                        background: linear-gradient(135deg, {dsi_color}22, {dsi_color}44);
-                                        border: 2px solid {dsi_color}; margin-bottom: 15px;">
-                                <h2 style="color: {dsi_color}; margin: 0;">Damage Severity Index (DSI)</h2>
-                                <h1 style="color: {dsi_color}; margin: 5px 0; font-size: 3rem;">{dsi_value:.1f}%</h1>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            # Triage Card (TR-8)
-                            level_lower = triage_result["level"].lower()
-                            card_class = f"triage-{level_lower}"
-                            
-                            st.markdown(f"""
-                            <div class="triage-card {card_class}">
-                                <h3 style="margin-top: 0;">{triage_result["icon"]} Tingkat: {triage_result["level"]} ({triage_result["level_id"]})</h3>
-                                <p><b>Rekomendasi Jalur:</b> {triage_result["path"]}</p>
-                                <p><b>SOP yang Direkomendasikan:</b> {triage_result["sop"]}</p>
-                                <p><b>Estimasi Waktu:</b> {triage_result["estimate"]}</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                            # Override notice (TR-7)
-                            if triage_result["override"]:
-                                st.warning(f"Override Diterapkan: {triage_result['override_reason']}")
-                            
-                            # Disclaimer (TR-5)
-                            disclaimer_text = get_disclaimer()
-                            st.caption(f"*{disclaimer_text}*")
-                            
-                            # =======================================================
-                            # STEP 3: LAPORAN INSPEKSI PDF
-                            # =======================================================
-                            st.markdown("---")
-                            st.markdown("### Unduh Laporan Inspeksi")
-                            
-                            # Save images to temp files for PDF (PD-5)
-                            temp_files = []
-                            try:
-                                original_tmp = _save_temp_image(img_original, prefix="orig_")
-                                temp_files.append(original_tmp)
-                                
-                                annotated_tmp = _save_temp_image(img_display, prefix="annot_")
-                                temp_files.append(annotated_tmp)
-                                
-                                enhanced_tmp = None
-                                if gate_status == "enhanced":
-                                    enhanced_tmp = _save_temp_image(img_processed, prefix="enh_")
-                                    temp_files.append(enhanced_tmp)
-                                
-                                # Build PDF context
-                                report_id = generate_report_id()
-                                from datetime import datetime
-                                timestamp_str = datetime.now().strftime("%d %B %Y, %H:%M:%S WIB")
-                                
-                                pdf_context = {
-                                    "report_id": report_id,
-                                    "timestamp": timestamp_str,
-                                    "original_image_path": original_tmp,
-                                    "annotated_image_path": annotated_tmp,
-                                    "enhanced_image_path": enhanced_tmp,
-                                    "gate_status": gate_status,
-                                    "gate_message": gate_message,
-                                    "detections": analysis_results,
-                                    "dsi": dsi_value,
-                                    "triage_result": triage_result,
-                                    "disclaimer": disclaimer_text,
-                                }
-                                
-                                # Build the PDF (PD-8)
-                                pdf_bytes = build_report(pdf_context)
-                                
-                                # Download button
-                                st.download_button(
-                                    label="Unduh Laporan Inspeksi (PDF)",
-                                    data=pdf_bytes,
-                                    file_name=f"laporan_inspeksi_{report_id}.pdf",
-                                    mime="application/pdf",
-                                    type="primary",
-                                )
-                                
-                                st.caption(f"ID Laporan: `{report_id}`")
-                                
-                            except Exception as e:
-                                st.error(f"Gagal membuat laporan PDF: {str(e)}")
-                            finally:
-                                # Cleanup temp files (PD-9)
-                                cleanup_temp_files(temp_files)
-                        else:
-                            st.info("Area terdeteksi berstatus 'Normal' (tidak dianalisis keparahannya).")
+                            st.caption(f"ID Laporan: `{report_id}`")
+                    else:
+                        st.info("Area terdeteksi berstatus 'Normal' (tidak dianalisis keparahannya).")
         else:
             st.info("Silakan unggah citra mobil melalui panel di sebelah kiri untuk memulai analisis.")
 

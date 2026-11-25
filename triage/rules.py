@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "override_box_threshold": 3,
+    "critical_classes": [],
 }
 
 # ---------------------------------------------------------------------------
@@ -34,7 +35,7 @@ TRIAGE_TABLE: List[Dict[str, Any]] = [
         "level_id": "Ringan",
         "path": "Fast-Track",
         "sop": "Compound dan Spot Repaint",
-        "estimate": "1–2 hari kerja",
+        "estimate": "1-2 hari kerja",
         "color": "#28a745",   # green
         "icon": "✅",
         "rank": 0,
@@ -46,7 +47,7 @@ TRIAGE_TABLE: List[Dict[str, Any]] = [
         "level_id": "Sedang",
         "path": "Standard Workshop Review",
         "sop": "Ketok Panel, Pendempulan, dan Full Panel Respray",
-        "estimate": "3–5 hari kerja",
+        "estimate": "3-5 hari kerja",
         "color": "#ffc107",   # yellow / amber
         "icon": "⚠️",
         "rank": 1,
@@ -181,7 +182,7 @@ def triage(
     """
 
     # TR-1: Validate DSI range
-    if not (0 <= dsi <= 100):
+    if isinstance(dsi, bool) or not isinstance(dsi, (int, float)) or not (0 <= dsi <= 100):
         raise ValueError(
             f"DSI must be between 0 and 100 (inclusive), got {dsi}"
         )
@@ -189,6 +190,7 @@ def triage(
     # Merge caller config with defaults
     cfg = {**DEFAULT_CONFIG, **(config or {})}
     override_box_threshold: int = cfg["override_box_threshold"]
+    critical_classes = {str(c).strip().lower() for c in cfg.get("critical_classes", [])}
 
     # TR-4: Look up base severity from the triage table
     entry = _lookup_by_dsi(dsi)
@@ -198,8 +200,20 @@ def triage(
     override_reason: Optional[str] = None
     original_level: Optional[str] = None
 
-    # TR-6: Override rule — escalate if num_boxes exceeds threshold
+    # TR-6: Override rule — escalate if num_boxes exceeds threshold or critical class is present
+    reasons = []
     if num_boxes > override_box_threshold:
+        reasons.append(
+            f"Jumlah area kerusakan ({num_boxes}) melebihi ambang batas ({override_box_threshold})"
+        )
+    if classes and critical_classes:
+        matched_critical = [str(c) for c in classes if str(c).strip().lower() in critical_classes]
+        if matched_critical:
+            reasons.append(
+                f"Terdeteksi kerusakan pada kelas kritis ({', '.join(dict.fromkeys(matched_critical))})"
+            )
+
+    if reasons:
         current_rank: int = entry["rank"]
         if current_rank < _MAX_RANK:
             original_level = entry["level"]
@@ -207,8 +221,7 @@ def triage(
             entry = escalated
             override = True
             override_reason = (
-                f"Jumlah area kerusakan ({num_boxes}) melebihi "
-                f"ambang batas ({override_box_threshold}), "
+                f"{'; '.join(reasons)}, "
                 f"tingkat keparahan dinaikkan dari {original_level} "
                 f"ke {entry['level']}"
             )
