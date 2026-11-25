@@ -151,6 +151,18 @@ st.markdown("""
     .triage-minor { background: linear-gradient(135deg, #28a745, #20c997); }
     .triage-moderate { background: linear-gradient(135deg, #ffc107, #fd7e14); color: #212529; }
     .triage-severe { background: linear-gradient(135deg, #dc3545, #c82333); }
+    /* Login Card Styling */
+    [data-testid="stForm"] {
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        border-radius: 14px;
+        padding: 24px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    }
+    [data-testid="stForm"] label,
+    [data-testid="stForm"] p {
+        color: #f8fafc !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -233,9 +245,47 @@ def _config_signature() -> str:
     return "|".join(parts)
 
 
-# --- Labels Mapping ---
+# --- Labels Mapping & Demo Auth Credentials ---
 CNN_CLASSES = {0: "Ringan / Minor", 1: "Rusak"}
 YOLO_TARGET_CLASS = 1 # 'Rusak' is index 1
+DEMO_USERS = {"user": "user"}
+
+
+def verify_credentials(username: str, password: str) -> bool:
+    """Validate login credentials against temporary non-DB credential map."""
+    clean_user = (username or "").strip()
+    expected = DEMO_USERS.get(clean_user)
+    return expected is not None and password == expected
+
+
+def render_login_page() -> None:
+    """Render login form with note for direct login while database is not connected."""
+    _, col_center, _ = st.columns([1, 1.3, 1])
+    with col_center:
+        st.markdown(
+            '<h3 style="text-align: center; color: #ffffff; margin-bottom: 12px;">Login Sistem</h3>',
+            unsafe_allow_html=True,
+        )
+        st.info(
+            "**Catatan:** Sistem saat ini belum terkoneksi ke database. "
+            "Anda dapat langsung login menggunakan akun berikut:\n"
+            "- **Username:** `user`\n"
+            "- **Password:** `user`"
+        )
+
+        with st.form("login_form", clear_on_submit=False):
+            username_input = st.text_input("Username", placeholder="Masukkan username (user)")
+            password_input = st.text_input("Password", type="password", placeholder="Masukkan password (user)")
+            submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
+
+            if submitted:
+                if verify_credentials(username_input, password_input):
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username_input.strip()
+                    st.rerun()
+                else:
+                    st.error("Username atau password salah. Gunakan username `user` dan password `user`.")
+
 
 # --- Main App ---
 def main():
@@ -245,10 +295,26 @@ def main():
     st.markdown('<h1 style="text-align: center; font-weight: 300; color: #ffffff;">Deteksi Kerusakan Bodi Mobil</h1>', unsafe_allow_html=True)
     st.markdown('<h3 style="text-align: center; color: #dddddd; margin-bottom: 40px; font-weight: 600;">Hybrid YOLOv9c & CNN-ResNet-CBAM</h3>', unsafe_allow_html=True)
 
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        render_login_page()
+        return
+
     with st.spinner("Memuat model AI... (Mohon tunggu)"):
         yolo_val, yolo_model, cnn_model, device = load_models()
     
     st.sidebar.markdown("### Panel Kontrol")
+    st.sidebar.success(f"Login sebagai: **{st.session_state.get('username', 'user')}**")
+    if st.sidebar.button("Logout", key="logout_button", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state["username"] = None
+        st.session_state.pop("analysis_key", None)
+        st.session_state.pop("analysis_cache", None)
+        st.rerun()
+
+    st.sidebar.markdown("---")
     page = st.sidebar.radio("Navigasi Halaman", ["Beranda", "Analisis Citra"])
     
     if page == "Beranda":
